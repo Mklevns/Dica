@@ -1,0 +1,37 @@
+# DICA — Dynamic In-Context Alignment: unified pipeline configuration.
+# Every value here has a built-in default in dica/config.py; the pipeline
+# runs with a partial file or no file at all. Override location with
+# $DICA_CONFIG.
+
+[ollama]
+host = "http://localhost:11434"
+model = "qwen3-coder:30b"          # generation model
+embed_model = "nomic-embed-text"   # local embedding model (must be pulled)
+num_ctx = 8192
+temperature = 0.2
+request_timeout_seconds = 300.0
+embed_timeout_seconds = 10.0
+
+[dispatch]
+top_k = 2
+lexical_weight = 1.0
+semantic_weight = 0.75             # set 0.0 to disable semantic scoring entirely
+structural_boost = 0.35            # per matched structural intent tag
+name_boost = 0.15                  # query token verbatim in chunk name
+
+[context]
+chars_per_token = 3.2              # conservative for dense Python source
+reserve_output_tokens = 1536       # head-room for the model's reply
+max_diagnostic_tokens = 1200       # linter output cap before middle-out truncation
+min_chunk_tokens = 64              # below this, don't bother truncating a chunk — drop it
+
+[sandbox]
+backend = "auto"                   # "docker" | "local" | "auto" (probe docker, else local)
+image = "dica-sandbox:latest"      # built from docker/Dockerfile.sandbox
+timeout_seconds = 90.0
+mem_limit = "512m"
+pids_limit = 64
+cpu_quota_percent = 100            # 100 == one full core
+
+[engine]
+max_retries = 3

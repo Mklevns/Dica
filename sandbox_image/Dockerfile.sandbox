@@ -1,0 +1,15 @@
+# DICA verification sandbox image.
+# Build:  docker build -t dica-sandbox:latest -f sandbox_image/Dockerfile.sandbox sandbox_image/
+FROM python:3.12-slim
+
+# Pin the checkers: the quality gate must be reproducible across rebuilds.
+RUN pip install --no-cache-dir "ruff==0.8.4" "mypy==1.14.1"
+
+# Non-root by default; the host also enforces no-new-privileges.
+RUN useradd --create-home --shell /usr/sbin/nologin dica
+USER dica
+
+COPY runner.py /opt/dica/runner.py
+
+# No default CMD on purpose: the host always specifies the exact command,
+# and an image with no entrypoint does nothing if run by accident.
