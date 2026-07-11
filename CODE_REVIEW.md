@@ -23,6 +23,8 @@ Work landed on `main` (pushed to `origin`) addresses the **critical** and **high
 | **H5** | No automated tests | **Done** | `tests/` + `pytest.ini` — **37 tests** covering extraction, vault, dispatch, budget, orchestrator, sandbox parse, pipeline |
 | **M1** | Local sandbox timeout orphans checkers | **Done** | `_local_verify` kills + reaps ruff/mypy on timeout (`_kill_process`) |
 | **M3** | Broad orphan container `ancestor` filter | **Done** | Sweep uses label + name prefix only (no image ancestor) |
+| **M4** | Vault score not true Jaccard | **Done** | `search` uses `|∩|/|∪|` over token bags |
+| **M5** | Empty query → empty dispatch | **Done** | Tag-richness fallback schedule when no lexical/semantic hits |
 | **M2** | Unbounded correction diagnostics | **Done** | Folded into H1 (`diagnostics` field + middle-out truncation) |
 | **L6** | No CI | **Partial** | GitHub Actions runs `pytest` on push/PR; `pyproject.toml` still open |
 | **M6** | `from main import` / packaging | **Partial** | Pipeline lives in `dica/pipeline.py`; adapters re-export helpers. Full `pyproject.toml` still open |
@@ -34,8 +36,6 @@ Work landed on `main` (pushed to `origin`) addresses the **critical** and **high
 
 | ID | Severity | Topic |
 |----|----------|--------|
-| **M4** | Medium | Vault score is not true Jaccard as comments suggest |
-| **M5** | Medium | Stopword-only queries → empty dispatch (no fallback) |
 | **M7** | Medium/Low | `distill_syntax` drops comments / type-ignores |
 | **M9** | Low | New `httpx.AsyncClient` per LLM completion |
 | **M10** | Low | `"Field"` in Pydantic markers → false positives |
@@ -219,9 +219,13 @@ Adapters: **`main.py`** (CLI) and **`app.py`** (Gradio) both drive `PipelineEngi
 
 - **Resolution:** `cleanup_orphaned_containers` matches only `dica.sandbox` label and `dica_sandbox_` name prefix. Image-ancestor filtering removed so manual containers from the sandbox image are not force-deleted.
 
-#### M4. Vault scoring is not Jaccard as documented — **Open**
+#### M4. Vault scoring is not Jaccard as documented — **Done**
 
-#### M5. Empty / stopword-only queries yield empty dispatch — **Open**
+- **Resolution:** `CodeVault.search` scores ``|query ∩ keywords| / |query ∪ keywords|``.
+
+#### M5. Empty / stopword-only queries yield empty dispatch — **Done**
+
+- **Resolution:** `IntentDispatcher` falls back to a tag-richness ranking (typing, docstring, decorators, async, pydantic, class) when there are no retrieval tokens or no lexical/semantic hits.
 
 #### M6. Package / import design — **Partial**
 
@@ -360,7 +364,7 @@ Overall: **reasonable local security**; not multi-user-ready without auth, rate 
 12. ~~**M3** — Narrow orphan container filters~~ **Done**  
 13. ~~CI workflow for `pytest`~~ **Done** (`.github/workflows/ci.yml`)  
 14. **`pyproject.toml`** + console scripts; optional pre-commit  
-15. **M4/M5** — Honest Jaccard (or rename) + empty-query fallback  
+15. ~~**M4/M5** — Honest Jaccard + empty-query fallback~~ **Done**  
 16. **M9** — Long-lived `httpx.AsyncClient` on `LocalLLMClient`  
 17. **L5/L9** — LICENSE; shared checker arg module for host + container runner  
 

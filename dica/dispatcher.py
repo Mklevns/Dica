@@ -5,9 +5,8 @@ Turns a raw user prompt ("Build an async CRUD router") into the top-K most
 
 Hybrid relevance model
 ----------------------
-1. **Lexical overlap** — the prompt is tokenized with the same tokenizer the
-   vault used at ingest time, producing a base score scaled by
-   ``DispatchConfig.lexical_weight``.
+1. **Lexical overlap** — Jaccard similarity over token bags
+   (``|q ∩ c| / |q ∪ c|``), scaled by ``DispatchConfig.lexical_weight``.
 2. **Structural boosts** — intent markers map onto ``ChunkTags``; matching
    tags add ``structural_boost`` / ``name_boost``.
 3. **Semantic similarity** (optional) — when a :class:`~dica.embeddings.SemanticIndex`
@@ -15,6 +14,10 @@ Hybrid relevance model
    local embed model is added (scaled by ``semantic_weight``). If the index
    is missing or Ollama is down, scoring degrades silently to lexical +
    structural only.
+
+Empty / stopword-only prompts (no retrieval tokens and no usable lexical or
+semantic signal) fall back to a **tag-richness** ranking so the pipeline
+still gets gold-standard anchors rather than an empty schedule (M5).
 
 Scoring weights and default ``top_k`` come from :class:`~dica.config.DispatchConfig`.
 """
@@ -43,6 +46,16 @@ _INTENT_MARKERS: dict[str, tuple[str, ...]] = {
     "has_pydantic": ("pydantic", "schema", "validation", "validator", "basemodel"),
     "has_decorators": ("decorator", "route", "router", "endpoint", "fixture"),
 }
+
+# Weak prior for empty-query fallback: prefer well-annotated gold chunks.
+_TAG_RICHNESS_WEIGHTS: tuple[tuple[str, float], ...] = (
+    ("uses_typing", 0.25),
+    ("has_docstring", 0.20),
+    ("has_decorators", 0.15),
+    ("is_async", 0.15),
+    ("has_pydantic", 0.15),
+    ("is_class", 0.10),
+)
 
 
 class DispatchResult(BaseModel):
@@ -102,8 +115,15 @@ class IntentDispatcher:
 
         Structural tags are *soft boosts*, not hard filters. Semantic scores
         are fail-soft: an unavailable index contributes 0.0 everywhere.
+
+        If the query has no retrieval tokens (or no hits after scoring) and
+        semantic ranking is unavailable, returns a tag-richness fallback
+        schedule so refinement passes still have anchors.
         """
         k = self._cfg.top_k if top_k is None else top_k
+        if k < 1 or len(self._vault) == 0:
+            return []
+
         intent = self.parse_intent(prompt)
 
         lexical_by_id: dict[str, float] = {
@@ -126,9 +146,18 @@ class IntentDispatcher:
         elif lexical_by_id:
             candidates = [c for c in self._vault if c.chunk_id in lexical_by_id]
             semantic_map = {}
+        elif not intent.keywords:
+            return self._fallback_by_tag_richness(
+                k, reason="empty/stopword-only query (no retrieval tokens)"
+            )
         else:
-            logger.info("Dispatch: no lexical hits and semantic unavailable.")
-            return []
+            return self._fallback_by_tag_richness(
+                k,
+                reason=(
+                    f"no lexical hits for keywords={sorted(intent.keywords)!r} "
+                    "and semantic unavailable"
+                ),
+            )
 
         scored: list[DispatchResult] = []
         for chunk in candidates:
@@ -158,9 +187,64 @@ class IntentDispatcher:
                 )
             )
 
-        scored.sort(key=lambda r: r.total, reverse=True)
+        if not scored:
+            return self._fallback_by_tag_richness(
+                k, reason="all candidates scored zero; using tag-richness prior"
+            )
+
+        scored.sort(key=lambda r: (r.total, r.chunk.name), reverse=True)
         top = scored[:k]
         mode = "hybrid" if use_semantic else "lexical"
+        self._log_ranking(top, mode=mode)
+        return top
+
+    def _fallback_by_tag_richness(
+        self, top_k: int, *, reason: str
+    ) -> list[DispatchResult]:
+        """Rank the full vault by annotation richness when retrieval is empty.
+
+        Prefer typed, documented, decorated gold chunks so Pass 1..N still
+        has something to align to. Stable secondary key: chunk name.
+        """
+        logger.warning(
+            "Dispatch fallback: %s — returning top-%d by tag richness.",
+            reason,
+            top_k,
+        )
+        scored = [
+            DispatchResult(
+                chunk=chunk,
+                lexical_score=0.0,
+                structural_score=self._tag_richness(chunk.tags),
+                semantic_score=0.0,
+            )
+            for chunk in self._vault
+        ]
+        scored.sort(key=lambda r: (r.total, r.chunk.name), reverse=True)
+        top = scored[:top_k]
+        self._log_ranking(top, mode="fallback")
+        return top
+
+    @staticmethod
+    def _tag_richness(tags: ChunkTags) -> float:
+        """Scalar prior over structural quality signals (not user intent)."""
+        return sum(
+            weight
+            for attr, weight in _TAG_RICHNESS_WEIGHTS
+            if getattr(tags, attr)
+        )
+
+    def _structural_score(self, tags: ChunkTags, intent: Intent) -> float:
+        """Additive boost for each structural intent the chunk satisfies."""
+        boost = self._cfg.structural_boost
+        return sum(
+            boost
+            for tag, wanted in intent.wanted_tags.items()
+            if wanted and getattr(tags, tag)
+        )
+
+    @staticmethod
+    def _log_ranking(top: list[DispatchResult], *, mode: str) -> None:
         for rank, result in enumerate(top, start=1):
             logger.info(
                 "Dispatch #%d [%s]: %s "
@@ -173,13 +257,3 @@ class IntentDispatcher:
                 result.semantic_score,
                 result.total,
             )
-        return top
-
-    def _structural_score(self, tags: ChunkTags, intent: Intent) -> float:
-        """Additive boost for each structural intent the chunk satisfies."""
-        boost = self._cfg.structural_boost
-        return sum(
-            boost
-            for tag, wanted in intent.wanted_tags.items()
-            if wanted and getattr(tags, tag)
-        )

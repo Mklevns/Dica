@@ -72,13 +72,30 @@ def test_unavailable_semantic_degrades(corpus_vault: CodeVault) -> None:
     assert all(h.semantic_score == 0.0 for h in hits)
 
 
-def test_empty_query_without_semantic_returns_empty(
+def test_empty_query_falls_back_to_tag_richness(
     corpus_vault: CodeVault,
 ) -> None:
+    """M5: stopword-only prompts still get a gold schedule."""
     dispatcher = IntentDispatcher(
         corpus_vault,
-        config=DispatchConfig(semantic_weight=0.0),
+        config=DispatchConfig(top_k=3, semantic_weight=0.0),
     )
-    # Only stopwords / no retrieval tokens
     hits = dispatcher.dispatch("the a an")
-    assert hits == []
+    assert len(hits) == 3
+    assert all(h.lexical_score == 0.0 for h in hits)
+    assert all(h.semantic_score == 0.0 for h in hits)
+    # Tag-richness structural prior should be non-zero for annotated gold.
+    assert any(h.structural_score > 0 for h in hits)
+    totals = [h.total for h in hits]
+    assert totals == sorted(totals, reverse=True)
+
+
+def test_no_lexical_hits_falls_back(corpus_vault: CodeVault) -> None:
+    dispatcher = IntentDispatcher(
+        corpus_vault,
+        config=DispatchConfig(top_k=2, semantic_weight=0.0),
+    )
+    # Nonsense tokens with no corpus overlap (avoid common words like "token").
+    hits = dispatcher.dispatch("xyzzyplugh qqxxyyzz")
+    assert len(hits) == 2
+    assert all(h.lexical_score == 0.0 for h in hits)

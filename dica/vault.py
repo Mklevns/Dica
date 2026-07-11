@@ -287,7 +287,15 @@ class CodeVault:
         *,
         required_tags: dict[str, bool] | None = None,
     ) -> list[tuple[CodeChunk, float]]:
-        """Return ``(chunk, keyword_overlap_score)`` pairs, unranked-filtered.
+        """Return ``(chunk, jaccard_score)`` pairs, unranked-filtered.
+
+        Lexical score is true **Jaccard similarity** over token sets::
+
+            |query ∩ chunk.keywords| / |query ∪ chunk.keywords|
+
+        Huge keyword bags that match everything are penalised by the union
+        in the denominator (M4). Empty queries yield no lexical hits
+        (the dispatcher applies a structural fallback — M5).
 
         ``required_tags`` performs hard filtering (e.g. ``{"is_async": True}``)
         before scoring; soft/boosted ranking is the dispatcher's job.
@@ -300,11 +308,16 @@ class CodeVault:
                 for tag, value in required_tags.items()
             ):
                 continue
+            if not query:
+                # No retrieval tokens — do not pretend every chunk matches.
+                if required_tags is None:
+                    continue
+                results.append((chunk, 0.0))
+                continue
             overlap = query & chunk.keywords
             if not overlap and required_tags is None:
                 continue
-            # Jaccard-flavoured: reward overlap, mildly penalise huge chunks
-            # matching everything.
-            score = len(overlap) / (len(query) or 1)
+            union = query | chunk.keywords
+            score = len(overlap) / len(union)
             results.append((chunk, score))
         return results

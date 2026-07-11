@@ -46,10 +46,39 @@ def test_ingest_attaches_decorators(tmp_path: Path) -> None:
 def test_search_finds_keyword_overlap(corpus_vault: CodeVault) -> None:
     hits = corpus_vault.search({"async", "repository"})
     assert hits
-    assert all(score >= 0 for _, score in hits)
+    assert all(0.0 <= score <= 1.0 for _, score in hits)
     # Higher overlap should not be negative
     hits.sort(key=lambda p: p[1], reverse=True)
     assert hits[0][1] >= hits[-1][1]
+
+
+def test_jaccard_penalizes_broad_keyword_bags(tmp_path: Path) -> None:
+    """M4: score is |∩| / |∪|, so huge bags matching the query score lower."""
+    src = tmp_path / "bags.py"
+    # Narrow chunk: keywords ≈ {match}
+    # Broad chunk: many extra tokens → larger union → lower Jaccard for same overlap.
+    src.write_text(
+        "def match_only():\n"
+        "    return 1\n"
+        "\n"
+        "def match_with_extra_alpha_beta_gamma_delta_epsilon():\n"
+        "    alpha = beta = gamma = delta = epsilon = 0\n"
+        "    return match_only() + alpha + beta + gamma + delta + epsilon\n",
+        encoding="utf-8",
+    )
+    vault = CodeVault()
+    vault.ingest_path(src)
+    hits = {chunk.name: score for chunk, score in vault.search({"match"})}
+    assert "match_only" in hits
+    assert "match_with_extra_alpha_beta_gamma_delta_epsilon" in hits
+    assert hits["match_only"] > hits["match_with_extra_alpha_beta_gamma_delta_epsilon"]
+    # query={match}, match_only keywords ⊇ {match, only} → |∩|/|∪| = 1/2
+    assert hits["match_only"] == 0.5
+
+
+def test_search_empty_query_returns_no_lexical_hits(corpus_vault: CodeVault) -> None:
+    assert corpus_vault.search([]) == []
+    assert corpus_vault.search(set()) == []
 
 
 def test_skips_syntax_error_file(tmp_path: Path) -> None:
