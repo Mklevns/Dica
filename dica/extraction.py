@@ -88,29 +88,63 @@ def _try_parse(code: str) -> str | None:
     return None
 
 
+def _accept_window(lines: list[str], start: int, end: int) -> str | None:
+    """Return a parseable strip of ``lines[start:end]``, or ``None``."""
+    candidate = "\n".join(lines[start:end]).strip()
+    if not candidate or _try_parse(candidate) is not None:
+        return None
+    n = len(lines)
+    if start or end != n:
+        logger.info(
+            "Salvaged code block by trimming %d leading / %d trailing line(s).",
+            start,
+            n - end,
+        )
+    return candidate
+
+
 def _salvage(code: str) -> str | None:
     """Trim leading/trailing prose lines until the block parses.
 
-    Scans every (start, end) window within ``_SALVAGE_SPAN`` lines of each
-    edge, preferring the largest surviving window. Interior contamination is
-    deliberately out of scope — see module docstring.
+    Common LLM failures only contaminate one edge, so we try trailing-only
+    then leading-only trims first (``O(_SALVAGE_SPAN)`` parses). The full
+    both-edge scan (``O(_SALVAGE_SPAN²)``) runs only if one-sided salvage
+    fails. The full untrimmed block is never re-parsed — the caller already
+    established that it fails ``ast.parse``.
+
+    Slice ends are inclusive of the deepest allowed trim: ``range`` stops are
+    exclusive, so the lower bound is ``lowest_end - 1``. Interior
+    contamination is deliberately out of scope — see module docstring.
     """
     lines = code.splitlines()
     n = len(lines)
-    max_start = min(_SALVAGE_SPAN, n)
-    min_end = max(n - _SALVAGE_SPAN, 1)
-    for start in range(max_start):
-        for end in range(n, max(min_end, start), -1):
-            candidate = "\n".join(lines[start:end]).strip()
-            if candidate and _try_parse(candidate) is None:
-                if start or end != n:
-                    logger.info(
-                        "Salvaged code block by trimming %d leading / %d "
-                        "trailing line(s).",
-                        start,
-                        n - end,
-                    )
-                return candidate
+    if n == 0:
+        return None
+    # Inclusive slice bounds: start in [0, max_start), end in (lowest_end, n].
+    max_start = min(_SALVAGE_SPAN, n)  # exclusive upper bound for start
+    # Deepest trailing trim keeps at least one line when n is small.
+    lowest_end = max(n - _SALVAGE_SPAN, 1)  # inclusive minimum end index
+
+    # Trailing-only: start=0, end = n-1 .. lowest_end (skip end=n: full block).
+    for end in range(n - 1, lowest_end - 1, -1):
+        hit = _accept_window(lines, 0, end)
+        if hit is not None:
+            return hit
+
+    # Leading-only: end=n, start = 1 .. max_start-1.
+    for start in range(1, max_start):
+        hit = _accept_window(lines, start, n)
+        if hit is not None:
+            return hit
+
+    # Both edges: only needed when prose sits on both ends.
+    for start in range(1, max_start):
+        # Keep at least one line after the start index.
+        end_floor = max(lowest_end, start + 1)
+        for end in range(n - 1, end_floor - 1, -1):
+            hit = _accept_window(lines, start, end)
+            if hit is not None:
+                return hit
     return None
 
 

@@ -43,6 +43,25 @@ def test_salvage_leading_prose() -> None:
     assert "Here is the code" not in (result.code or "")
 
 
+def test_salvage_trailing_prose() -> None:
+    body = "x = 1\nLet me know if you need anything else.\n"
+    result = extract_python_code(fenced_python(body))
+    assert result.ok is True
+    assert result.code is not None
+    assert "x = 1" in result.code
+    assert "Let me know" not in (result.code or "")
+
+
+def test_salvage_both_edges() -> None:
+    body = "Sure, here you go:\nx = 1\nHope that helps!\n"
+    result = extract_python_code(fenced_python(body))
+    assert result.ok is True
+    assert result.code is not None
+    assert result.code.strip() == "x = 1"
+    assert "Sure" not in (result.code or "")
+    assert "Hope" not in (result.code or "")
+
+
 def test_unclosed_fence_truncated() -> None:
     resp = f"prefix\n{FENCE}python\nx = 42\n"
     result = extract_python_code(resp)

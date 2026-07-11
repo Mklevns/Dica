@@ -18,6 +18,7 @@ logs/exit codes; the UI turns them into live code/log panels.
 from __future__ import annotations
 
 import ast
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -314,7 +315,11 @@ class PipelineEngine:
                 )
                 return
 
-            extraction: ExtractionResult | None = extract_python_code(response)
+            # extract_python_code may run up to ~_SALVAGE_SPAN**2 ast.parse
+            # calls on a dirty fence; keep that CPU work off the event loop.
+            extraction: ExtractionResult | None = await asyncio.to_thread(
+                extract_python_code, response
+            )
             code = unwrap_extraction(extraction)
             if code is not None:
                 result.payload = payload
@@ -378,7 +383,7 @@ class PipelineEngine:
             message=f"vault: {self._chunk_count} gold chunks indexed"
         )
 
-        hits: list[DispatchResult] = self._dispatcher.dispatch(task)
+        hits: list[DispatchResult] = await self._dispatcher.dispatch(task)
         matched = (
             ", ".join(f"{h.chunk.name} ({h.total:.2f})" for h in hits)
             or "(none)"

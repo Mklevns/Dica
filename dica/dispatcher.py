@@ -108,8 +108,14 @@ class IntentDispatcher:
         logger.debug("Parsed intent: keywords=%s wanted_tags=%s", keywords, wanted)
         return Intent(keywords=keywords, wanted_tags=wanted)
 
-    def dispatch(self, prompt: str, *, top_k: int | None = None) -> list[DispatchResult]:
+    async def dispatch(
+        self, prompt: str, *, top_k: int | None = None
+    ) -> list[DispatchResult]:
         """Return the ``top_k`` most relevant chunks for ``prompt``.
+
+        Async so semantic scoring can ``await`` the embed HTTP call on the
+        caller's event loop (see :meth:`~dica.embeddings.SemanticIndex.score`)
+        without blocking via ``run_coro_blocking``.
 
         When ``top_k`` is omitted, :attr:`DispatchConfig.top_k` is used.
 
@@ -140,7 +146,7 @@ class IntentDispatcher:
         if use_semantic:
             # Full vault: semantic can surface chunks with weak/zero keyword overlap.
             candidates: list[CodeChunk] = list(self._vault)
-            semantic_map = self._semantic.score_sync(
+            semantic_map = await self._semantic.score(
                 prompt, (c.chunk_id for c in candidates)
             )
         elif lexical_by_id:

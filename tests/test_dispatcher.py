@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dica.config import DispatchConfig
 from dica.dispatcher import IntentDispatcher
 from dica.vault import CodeVault
@@ -12,19 +14,20 @@ class _FakeSemanticIndex:
         self.boost_id = boost_id
         self.available = available
 
-    def score_sync(self, query: str, chunk_ids: object) -> dict[str, float]:
+    async def score(self, query: str, chunk_ids: object) -> dict[str, float]:
         return {
             cid: (1.0 if cid == self.boost_id else 0.05)
             for cid in chunk_ids  # type: ignore[union-attr]
         }
 
 
-def test_lexical_dispatch_ranks_async_crud(corpus_vault: CodeVault) -> None:
+@pytest.mark.asyncio
+async def test_lexical_dispatch_ranks_async_crud(corpus_vault: CodeVault) -> None:
     dispatcher = IntentDispatcher(
         corpus_vault,
         config=DispatchConfig(top_k=3, semantic_weight=0.0),
     )
-    hits = dispatcher.dispatch("async CRUD pydantic router")
+    hits = await dispatcher.dispatch("async CRUD pydantic router")
     assert len(hits) <= 3
     assert hits
     assert all(h.semantic_score == 0.0 for h in hits)
@@ -40,7 +43,8 @@ def test_parse_intent_tags(corpus_vault: CodeVault) -> None:
     assert intent.wanted_tags.get("has_pydantic") is True
 
 
-def test_semantic_boost_changes_ranking(corpus_vault: CodeVault) -> None:
+@pytest.mark.asyncio
+async def test_semantic_boost_changes_ranking(corpus_vault: CodeVault) -> None:
     target = list(corpus_vault)[-1]
     fake = _FakeSemanticIndex(target.chunk_id)
     dispatcher = IntentDispatcher(
@@ -54,25 +58,27 @@ def test_semantic_boost_changes_ranking(corpus_vault: CodeVault) -> None:
         ),
         semantic_index=fake,  # type: ignore[arg-type]
     )
-    hits = dispatcher.dispatch("completely unrelated query xyzzy")
+    hits = await dispatcher.dispatch("completely unrelated query xyzzy")
     assert hits
     assert hits[0].chunk.chunk_id == target.chunk_id
     assert hits[0].semantic_score > 0
 
 
-def test_unavailable_semantic_degrades(corpus_vault: CodeVault) -> None:
+@pytest.mark.asyncio
+async def test_unavailable_semantic_degrades(corpus_vault: CodeVault) -> None:
     fake = _FakeSemanticIndex("nope", available=False)
     dispatcher = IntentDispatcher(
         corpus_vault,
         config=DispatchConfig(top_k=2, semantic_weight=0.75),
         semantic_index=fake,  # type: ignore[arg-type]
     )
-    hits = dispatcher.dispatch("async repository")
+    hits = await dispatcher.dispatch("async repository")
     assert hits
     assert all(h.semantic_score == 0.0 for h in hits)
 
 
-def test_empty_query_falls_back_to_tag_richness(
+@pytest.mark.asyncio
+async def test_empty_query_falls_back_to_tag_richness(
     corpus_vault: CodeVault,
 ) -> None:
     """M5: stopword-only prompts still get a gold schedule."""
@@ -80,7 +86,7 @@ def test_empty_query_falls_back_to_tag_richness(
         corpus_vault,
         config=DispatchConfig(top_k=3, semantic_weight=0.0),
     )
-    hits = dispatcher.dispatch("the a an")
+    hits = await dispatcher.dispatch("the a an")
     assert len(hits) == 3
     assert all(h.lexical_score == 0.0 for h in hits)
     assert all(h.semantic_score == 0.0 for h in hits)
@@ -90,12 +96,13 @@ def test_empty_query_falls_back_to_tag_richness(
     assert totals == sorted(totals, reverse=True)
 
 
-def test_no_lexical_hits_falls_back(corpus_vault: CodeVault) -> None:
+@pytest.mark.asyncio
+async def test_no_lexical_hits_falls_back(corpus_vault: CodeVault) -> None:
     dispatcher = IntentDispatcher(
         corpus_vault,
         config=DispatchConfig(top_k=2, semantic_weight=0.0),
     )
     # Nonsense tokens with no corpus overlap (avoid common words like "token").
-    hits = dispatcher.dispatch("xyzzyplugh qqxxyyzz")
+    hits = await dispatcher.dispatch("xyzzyplugh qqxxyyzz")
     assert len(hits) == 2
     assert all(h.lexical_score == 0.0 for h in hits)

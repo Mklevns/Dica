@@ -19,13 +19,13 @@ Design constraints honoured here
   lexical+structural scoring. Retrieval quality degrades; the pipeline
   never crashes. Under concurrent build, failure is now *per batch*: a
   failed batch is skipped, every successful batch is kept.
-* **Sync call sites keep working.** ``build_sync`` / ``score_sync`` wrap
-  the coroutines with loop-aware execution: ``asyncio.run`` when no loop
-  is running (CLI startup, ``app.py:main`` before ``launch()``), or a
-  short-lived worker thread with its own loop when one *is* running (a
-  sync dispatcher invoked from inside ``RefactorEngine.run``). Calling
-  ``asyncio.run`` inside a live loop raises ``RuntimeError`` — the thread
-  path is what makes the shim safe from anywhere.
+* **Async is the hot path.** ``PipelineEngine`` and
+  ``IntentDispatcher.dispatch`` await :meth:`SemanticIndex.score` on the
+  running event loop so embedding HTTP never freezes concurrent work.
+  ``build_sync`` / ``score_sync`` remain for *synchronous* call sites only
+  (engine construction, scripts, tests): they use :func:`run_coro_blocking`
+  (``asyncio.run`` when no loop is running, or a worker thread when one is).
+  Do **not** call those shims from code already on the asyncio loop.
 
 Concurrency honesty note: a single-GPU Ollama instance largely serializes
 embedding forward passes, so the win here is eliminating per-request HTTP
@@ -66,11 +66,11 @@ def run_coro_blocking(coro: Coroutine[Any, Any, _T]) -> _T:
     """Run ``coro`` to completion from a synchronous call site, safely.
 
     * No running loop (process startup, plain scripts): ``asyncio.run``.
-    * Running loop present (sync code invoked from within a coroutine,
-      e.g. a sync dispatcher inside the Gradio engine): spin the coroutine
-      on a dedicated worker thread with its own event loop and block on
-      the future. This never touches — and therefore never stalls or
-      re-enters — the caller's loop.
+    * Running loop present (sync code nested inside a coroutine, e.g.
+      ``SemanticIndex.build_sync`` during engine construction if a loop is
+      already active): run the coroutine on a dedicated worker thread with
+      its own event loop and block on the future. Prefer ``await`` on the
+      hot path instead of this shim so the caller's loop is not frozen.
     """
     try:
         asyncio.get_running_loop()
@@ -251,12 +251,11 @@ class SemanticIndex:
     def score_sync(
         self, query: str, chunk_ids: Iterable[str]
     ) -> dict[str, float]:
-        """Blocking wrapper over :meth:`score` for the synchronous dispatcher.
+        """Blocking wrapper over :meth:`score` for synchronous call sites only.
 
-        Safe to call both before the event loop exists and from sync code
-        running *inside* a coroutine (the worker-thread path in
-        :func:`run_coro_blocking` covers the latter). One query embed is a
-        single short round-trip, so the thread hop is negligible next to
-        the model call it precedes.
+        Prefer :meth:`score` (``await``) from any coroutine — including
+        :meth:`dica.dispatcher.IntentDispatcher.dispatch` and
+        :meth:`dica.pipeline.PipelineEngine.run`. Using this wrapper on the
+        asyncio event loop blocks the loop for the full embed round-trip.
         """
         return run_coro_blocking(self.score(query, chunk_ids))
