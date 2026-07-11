@@ -51,7 +51,8 @@ class DispatchConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    top_k: int = Field(default=2, ge=1)
+    # Default covers the standard multi-pass schedule (one hit per refinement).
+    top_k: int = Field(default=3, ge=1)
     lexical_weight: float = Field(default=1.0, ge=0.0)
     semantic_weight: float = Field(default=0.75, ge=0.0)
     structural_boost: float = Field(default=0.35, ge=0.0)

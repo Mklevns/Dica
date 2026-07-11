@@ -7,7 +7,7 @@ Use it from the CLI (`main.py`) or the Gradio web UI (`app.py`).
 ## Features
 
 - **Corpus vault** — ingest reference Python modules via AST into an in-memory index
-- **Intent dispatch** — hybrid lexical + semantic retrieval of relevant gold-standard chunks
+- **Intent dispatch** — hybrid lexical + structural + semantic (Ollama embeddings) retrieval of gold-standard chunks
 - **Multi-pass refinement** — draft, then align one reference at a time with fail-fast `ast.parse` rollback
 - **Sandbox verification** — ruff + mypy gate (Docker or local backend)
 - **Gradio copilot UI** — live streaming of each pipeline stage
@@ -16,14 +16,15 @@ Use it from the CLI (`main.py`) or the Gradio web UI (`app.py`).
 
 ```
 dica/
-├── main.py                 # CLI pipeline entrypoint
-├── app.py                  # Gradio refactoring copilot UI
+├── main.py                 # Thin CLI adapter
+├── app.py                  # Thin Gradio UI adapter
 ├── config.toml             # Unified pipeline configuration
 ├── requirements.txt
 ├── reference_corpus/       # Gold-standard .py modules
 ├── sandbox_image/          # Docker sandbox image + runner
 ├── scripts/                # Ad-hoc helpers
 └── dica/
+    ├── pipeline.py         # Shared multi-pass engine (CLI + UI)
     ├── config.py           # Config loading (TOML + defaults)
     ├── vault.py            # AST ingestor + in-memory index
     ├── dispatcher.py       # Keyword + structural-tag retrieval
@@ -57,23 +58,27 @@ python -m venv .venv
 # macOS / Linux
 source .venv/bin/activate
 
-# Install dependencies
+# Install core pipeline dependencies (CLI)
 pip install -r requirements.txt
+
+# Optional: Gradio UI (python app.py)
+pip install -r requirements-ui.txt
+
+# Optional: Docker sandbox backend (auto/local still works without this)
+pip install -r requirements-sandbox.txt
+# docker build -t dica-sandbox:latest -f sandbox_image/Dockerfile.sandbox sandbox_image/
 
 # Pull Ollama models (names must match config.toml)
 ollama pull qwen3-coder:30b
 ollama pull nomic-embed-text
 ```
 
-Optional Gradio UI dependency (if not already available in your environment):
-
-```bash
-pip install gradio
-```
-
 ## Configuration
 
-Defaults live in `config.toml` (Ollama host/model, dispatch weights, sandbox limits, retry budget). Override the file path with:
+Defaults live in `config.toml` and are loaded at runtime via `dica.config.get_config()`
+(Ollama host/model/timeouts, dispatch `top_k`/weights/boosts, sandbox limits, correction
+budget). CLI flags `--model` and `--max-attempts` default to those values and may override
+them per run. Override the config file path with:
 
 ```bash
 export DICA_CONFIG=/path/to/config.toml   # macOS / Linux
@@ -108,6 +113,18 @@ python main.py --corpus ./reference_corpus --model phi4 --max-attempts 5 "..."
 python app.py
 # → http://127.0.0.1:7860
 ```
+
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite covers extraction (including the `ok` gate), vault ingest, hybrid
+dispatch, context budgeting, orchestrator corrections, sandbox JSON parsing,
+and a scripted end-to-end pass through `PipelineEngine` (no live Ollama required
+for most tests).
 
 ## Extending
 

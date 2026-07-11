@@ -1,0 +1,5 @@
+# Docker SDK for the containerized ruff/mypy sandbox backend.
+# Also requires a local Docker daemon and the dica-sandbox image:
+#   docker build -t dica-sandbox:latest -f sandbox_image/Dockerfile.sandbox sandbox_image/
+-r requirements.txt
+docker>=7.0

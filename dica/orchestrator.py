@@ -29,10 +29,14 @@ from collections.abc import Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from dica.context import AssembledPayload, BudgetSection, ContextBudget
 from dica.dispatcher import DispatchResult
 from dica.vault import ChunkTags
 
 logger = logging.getLogger(__name__)
+
+DIAGNOSTICS_OPEN = "[VERIFICATION DIAGNOSTICS]"
+DIAGNOSTICS_CLOSE = "[END VERIFICATION DIAGNOSTICS]"
 
 # ---------------------------------------------------------------------- #
 # Sentinel delimiters — single source of truth for the prompt grammar.
@@ -192,6 +196,10 @@ class PromptPayload(BaseModel):
             pure generation mode; a string selects refactor mode and adds
             the delimited target section to :meth:`render`.
         target_task: The user's active instruction.
+        diagnostics: Optional sandbox / extraction diagnostics. When set,
+            :meth:`render_budgeted` places them in their own section with
+            middle-out truncation — never stuff multi-kilobyte mypy dumps
+            into the task text unchecked.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -209,64 +217,123 @@ class PromptPayload(BaseModel):
         description="Messy source to refactor; None = generation mode.",
     )
     target_task: str = Field(min_length=1)
+    diagnostics: str | None = Field(
+        default=None,
+        description="Optional verification / extraction diagnostics section.",
+    )
+
+    def _constraints_section(self) -> str:
+        constraint_lines = self.dynamic_constraints or (_FALLBACK_CONSTRAINT,)
+        constraint_body = "\n".join(f"- {rule}" for rule in constraint_lines)
+        return f"{CONSTRAINTS_OPEN}\n{constraint_body}\n{CONSTRAINTS_CLOSE}"
+
+    def _reference_sections(self) -> list[BudgetSection]:
+        """One budgeted section per reference (droppable independently)."""
+        if not self.references:
+            return [
+                BudgetSection(
+                    name="(no references)",
+                    text=f"{REF_OPEN}\n# (no references matched)\n{REF_CLOSE}",
+                )
+            ]
+        sections: list[BudgetSection] = []
+        for i, ref in enumerate(self.references, start=1):
+            body = f"# Reference {i}: {ref.name}  (from {ref.origin})\n{ref.source}"
+            # Each reference is its own droppable unit; delimiters wrap the
+            # admitted subset at assemble time via a single REF block when
+            # we join — here each chunk is self-describing for ranking drops.
+            sections.append(
+                BudgetSection(
+                    name=ref.name,
+                    text=body,
+                )
+            )
+        return sections
 
     def render(self) -> str:
-        """Serialize the payload into the recency-anchored prompt format.
+        """Serialize the full prompt with no token budget (dry-run / debug).
 
-        Layout (fixed order)::
-
-            <system instructions>
-
-            [TARGET SCRIPT TO REFACTOR]        <- only when target_code set
-            <the code>
-            [END TARGET SCRIPT]
-
-            [REQUIRED ARCHITECTURAL CONSTRAINTS]
-            - <rule 1>
-            - <rule 2>
-            [END REQUIRED ARCHITECTURAL CONSTRAINTS]
-
-            [GOLD STANDARD REFERENCE CODE]
-            # Reference 1: <name>  (from <origin>)
-            <AST-pruned code>
-            [END GOLD STANDARD REFERENCE CODE]
-
-            [ACTIVE TARGET TASK]
-            <task>
-            [END ACTIVE TARGET TASK]
-
-        The task renders last so it occupies the highest-recency position in
-        the context window, immediately before generation begins.
-
-        Returns:
-            The complete single-string prompt.
+        Prefer :meth:`render_budgeted` for any prompt that hits the model so
+        diagnostics and references respect ``num_ctx``.
         """
         parts: list[str] = [self.system_instructions]
-
         if self.target_code is not None:
             parts.append(
                 f"{TARGET_OPEN}\n{self.target_code.rstrip()}\n{TARGET_CLOSE}"
             )
-
-        constraint_lines = self.dynamic_constraints or (_FALLBACK_CONSTRAINT,)
-        constraint_body = "\n".join(f"- {rule}" for rule in constraint_lines)
+        parts.append(self._constraints_section())
+        if self.diagnostics:
+            parts.append(
+                f"{DIAGNOSTICS_OPEN}\n{self.diagnostics.strip()}\n"
+                f"{DIAGNOSTICS_CLOSE}"
+            )
+        ref_sections = self._reference_sections()
+        if len(ref_sections) == 1 and ref_sections[0].name == "(no references)":
+            parts.append(ref_sections[0].text)
+        else:
+            body = "\n\n".join(s.text for s in ref_sections)
+            parts.append(f"{REF_OPEN}\n{body}\n{REF_CLOSE}")
         parts.append(
-            f"{CONSTRAINTS_OPEN}\n{constraint_body}\n{CONSTRAINTS_CLOSE}"
+            f"{TASK_OPEN}\n{self.target_task.strip()}\n{TASK_CLOSE}"
         )
-
-        ref_sections: list[str] = [
-            f"# Reference {i}: {ref.name}  (from {ref.origin})\n{ref.source}"
-            for i, ref in enumerate(self.references, start=1)
-        ]
-        ref_body = (
-            "\n\n".join(ref_sections)
-            if ref_sections
-            else "# (no references matched)"
-        )
-        parts.append(f"{REF_OPEN}\n{ref_body}\n{REF_CLOSE}")
-
-        parts.append(f"{TASK_OPEN}\n{self.target_task.strip()}\n{TASK_CLOSE}")
         return "\n\n".join(parts) + "\n"
+
+    def render_budgeted(self, budget: ContextBudget) -> AssembledPayload:
+        """Serialize into the recency-anchored layout under ``budget``.
+
+        Layout::
+
+            <system instructions>
+            [TARGET SCRIPT TO REFACTOR]   (if target_code set; whole or drop)
+            [REQUIRED ARCHITECTURAL CONSTRAINTS]
+            [VERIFICATION DIAGNOSTICS]    (if diagnostics set; middle-out)
+            gold reference chunks         (per-chunk drop when over budget)
+            [ACTIVE TARGET TASK]          (always last)
+
+        Returns:
+            Assembled text plus a :class:`BudgetReport` for logging.
+        """
+        fixed: list[BudgetSection] = []
+        if self.target_code is not None:
+            fixed.append(
+                BudgetSection(
+                    name="target_script",
+                    text=(
+                        f"{TARGET_OPEN}\n{self.target_code.rstrip()}\n"
+                        f"{TARGET_CLOSE}"
+                    ),
+                )
+            )
+        fixed.append(
+            BudgetSection(name="constraints", text=self._constraints_section())
+        )
+
+        assembled = budget.assemble_recency(
+            system=self.system_instructions,
+            fixed_sections=fixed,
+            references=self._reference_sections(),
+            diagnostics=self.diagnostics,
+            task=f"{TASK_OPEN}\n{self.target_task.strip()}\n{TASK_CLOSE}",
+        )
+        report = assembled.report
+        if report.dropped_chunks or report.diagnostics_truncated:
+            logger.info(
+                "Prompt budget: used=%d/%d headroom=%d dropped=%s "
+                "diag_trunc=%s",
+                report.used_tokens,
+                report.budget_tokens,
+                report.headroom,
+                ", ".join(report.dropped_chunks) or "(none)",
+                report.diagnostics_truncated,
+            )
+        else:
+            logger.debug(
+                "Prompt budget: used=%d/%d headroom=%d",
+                report.used_tokens,
+                report.budget_tokens,
+                report.headroom,
+            )
+        return assembled
 
 
 class PromptOrchestrator:
@@ -377,32 +444,53 @@ class PromptOrchestrator:
         )
 
     def build_correction(
-        self, original: PromptPayload, failed_code: str, diagnostics: str
+        self,
+        original: PromptPayload,
+        failed_code: str,
+        diagnostics: str,
+        *,
+        budget: ContextBudget | None = None,
     ) -> PromptPayload:
         """Wrap sandbox failures into a localized self-correction payload.
 
         The original references, dynamic constraints, AND target script are
         preserved — the style anchor, the architectural contract, and the
         refactoring subject must not drift across retries — while the task
-        is rewritten to include the failing code and the verbatim
-        linter/type-checker output.
+        is rewritten around the failing code. Verbatim checker output is
+        stored on :attr:`PromptPayload.diagnostics` so
+        :meth:`PromptPayload.render_budgeted` can middle-out truncate it
+        instead of letting multi-kilobyte mypy dumps blow ``num_ctx``.
 
         Args:
             original: The payload whose output failed verification.
             failed_code: The extracted code that failed the gate.
-            diagnostics: Verbatim ruff/mypy failure output.
+            diagnostics: Verbatim ruff/mypy (or extraction) failure output.
+            budget: Optional budget used to cap an oversized failing-code
+                snippet before it is embedded in the task text.
 
         Returns:
-            A new immutable payload carrying the correction task.
+            A new immutable payload carrying the correction task + diagnostics.
         """
+        code_snippet = failed_code.strip()
+        if budget is not None:
+            # Cap the failing file so the task itself cannot dominate the window;
+            # diagnostics get a separate middle-out pass at render time.
+            cap = max(256, budget.max_diagnostic_tokens)
+            code_snippet, truncated = budget.truncate_middle(code_snippet, cap)
+            if truncated:
+                logger.info(
+                    "Correction payload: truncated failing code to ~%d tokens.",
+                    cap,
+                )
+
         correction_task = (
             "Your previous attempt at the task below FAILED automated "
             "verification.\n\n"
             f"Original task:\n{original.target_task.strip()}\n\n"
             "Your failing code:\n"
-            f"```python\n{failed_code.strip()}\n```\n\n"
-            "Verification diagnostics (ruff + mypy):\n"
-            f"```\n{diagnostics.strip()}\n```\n\n"
+            f"```python\n{code_snippet}\n```\n\n"
+            "Verification diagnostics appear in the "
+            f"{DIAGNOSTICS_OPEN} section (may be truncated). "
             "Fix EVERY reported issue and re-emit the complete corrected "
             "file as a single ```python block. Do not explain the changes."
         )
@@ -412,6 +500,7 @@ class PromptOrchestrator:
             dynamic_constraints=original.dynamic_constraints,
             target_code=original.target_code,
             target_task=correction_task,
+            diagnostics=diagnostics.strip() or None,
         )
 
     def build_draft_payload(

@@ -92,12 +92,28 @@ class AssembledPayload(BaseModel):
 class ContextBudget:
     """Assembles LLM payloads that provably fit inside ``num_ctx``."""
 
-    def __init__(self, ollama: OllamaConfig, context: ContextConfig) -> None:
+    def __init__(
+        self,
+        ollama: OllamaConfig,
+        context: ContextConfig,
+        *,
+        num_ctx: int | None = None,
+    ) -> None:
         self._cpt = context.chars_per_token
         self._max_diag = context.max_diagnostic_tokens
-        self._budget = max(
-            256, ollama.num_ctx - context.reserve_output_tokens
-        )
+        self._min_chunk = context.min_chunk_tokens
+        window = num_ctx if num_ctx is not None else ollama.num_ctx
+        self._budget = max(256, window - context.reserve_output_tokens)
+
+    @property
+    def budget_tokens(self) -> int:
+        """Total token budget available for the prompt (excludes reserved output)."""
+        return self._budget
+
+    @property
+    def max_diagnostic_tokens(self) -> int:
+        """Configured cap for sandbox / extraction diagnostics."""
+        return self._max_diag
 
     def _tokens(self, text: str) -> int:
         return estimate_tokens(text, chars_per_token=self._cpt)
@@ -198,3 +214,130 @@ class ContextBudget:
                 self._cpt,
             )
         return AssembledPayload(text=separator.join(parts), report=report)
+
+    def assemble_recency(
+        self,
+        *,
+        system: str,
+        fixed_sections: Sequence[BudgetSection] = (),
+        references: Sequence[BudgetSection] = (),
+        diagnostics: str | None = None,
+        task: str,
+        separator: str = "\n\n",
+    ) -> AssembledPayload:
+        """Assemble a recency-anchored prompt that fits the token budget.
+
+        Layout (matches the orchestrator grammar)::
+
+            <system>
+            <fixed sections that fit — target script, constraints, ...>
+            <diagnostics, middle-out truncated when present>
+            <reference chunks that fit, best-rank first>
+            <task>   ← always last (highest recency)
+
+        Priority:
+        1. **System + task** — reserved first; task is tail-truncated only if
+           the pair alone overflows the budget.
+        2. **Fixed sections** — admitted in order while space remains
+           (whole section or drop; never partial code/constraints).
+        3. **Diagnostics** — capped at ``max_diagnostic_tokens`` with
+           middle-out truncation.
+        4. **References** — greedy best-rank-first; dropped wholly when
+           they do not fit (or fall below ``min_chunk_tokens`` remaining).
+        """
+        sep_tokens = self._tokens(separator)
+
+        # Reserve system + task (task last in the final string, first in budget).
+        system_tokens = self._tokens(system)
+        task_text = task
+        task_tokens = self._tokens(task_text)
+        reserved = system_tokens + task_tokens + sep_tokens
+        if reserved > self._budget:
+            overflow = reserved - self._budget
+            keep_chars = max(0, len(task_text) - int(overflow * self._cpt))
+            task_text = task_text[:keep_chars]
+            task_tokens = self._tokens(task_text)
+            logger.warning(
+                "System+task alone overflow the context budget; "
+                "tail-truncated task by ~%d tokens.",
+                overflow,
+            )
+            reserved = min(self._budget, system_tokens + task_tokens + sep_tokens)
+
+        used_middle = 0
+        middle: list[str] = []
+        dropped: list[str] = []
+
+        def remaining() -> int:
+            return self._budget - reserved - used_middle
+
+        for section in fixed_sections:
+            cost = self._tokens(section.text) + sep_tokens
+            if cost <= remaining():
+                middle.append(section.text)
+                used_middle += cost
+            else:
+                dropped.append(section.name)
+                logger.info(
+                    "Context budget dropped fixed section %r (~%d tokens).",
+                    section.name,
+                    cost,
+                )
+
+        diagnostics_truncated = False
+        if diagnostics:
+            allowance = min(self._max_diag, max(0, remaining() - sep_tokens))
+            if allowance > 0:
+                diag_body, diagnostics_truncated = self.truncate_middle(
+                    diagnostics, allowance
+                )
+                diag_block = (
+                    "[VERIFICATION DIAGNOSTICS]\n"
+                    f"{diag_body}\n"
+                    "[END VERIFICATION DIAGNOSTICS]"
+                )
+                cost = self._tokens(diag_block) + sep_tokens
+                if cost <= remaining():
+                    middle.append(diag_block)
+                    used_middle += cost
+                else:
+                    diagnostics_truncated = True
+            else:
+                diagnostics_truncated = True
+
+        for section in references:
+            cost = self._tokens(section.text) + sep_tokens
+            # Skip crumbs that would burn the last tokens for little signal.
+            if cost > remaining() or remaining() < self._min_chunk:
+                dropped.append(section.name)
+            else:
+                middle.append(section.text)
+                used_middle += cost
+
+        if dropped:
+            logger.info(
+                "Context budget dropped %d section(s): %s",
+                len(dropped),
+                ", ".join(dropped),
+            )
+
+        parts = [system, *middle, task_text]
+        text = separator.join(parts) + "\n"
+        used = self._tokens(text)
+
+        report = BudgetReport(
+            budget_tokens=self._budget,
+            used_tokens=used,
+            diagnostics_truncated=diagnostics_truncated,
+            dropped_chunks=tuple(dropped),
+        )
+        if report.headroom < _HEADROOM_WARN_TOKENS:
+            logger.warning(
+                "Context headroom critically low: %d tokens remaining of a "
+                "%d-token budget (used=%d, chars_per_token=%.2f).",
+                report.headroom,
+                report.budget_tokens,
+                report.used_tokens,
+                self._cpt,
+            )
+        return AssembledPayload(text=text, report=report)
