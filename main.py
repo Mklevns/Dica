@@ -100,9 +100,9 @@ async def run_pipeline(
 
         if event.dry_run_text is not None:
             banner = "=" * 72
-            print(f"\n{banner}\nDRY RUN — Pass 0 draft payload:\n{banner}")
+            print(f"\n{banner}\nDRY RUN — selector prompt (catalog + task):\n{banner}")
             print(event.dry_run_text)
-            print(f"{banner}\nPlanned refinement schedule:")
+            print(f"{banner}\nResolved generation plan:")
             for line in event.schedule_lines:
                 print(line)
 
@@ -138,7 +138,7 @@ async def run_pipeline(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     cfg = get_config()
     parser = argparse.ArgumentParser(
-        description="Dynamic In-Context Alignment pipeline (4-pass refinement)"
+        description="Dynamic In-Context Alignment pipeline (agentic selection)"
     )
     parser.add_argument(
         "query", help="Target task, e.g. 'Build an async CRUD router'"
@@ -167,8 +167,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Render the Pass 0 payload and the refinement "
-        "schedule, then exit without calling the model",
+        help="Resolve a blueprint via dispatcher fallback, render the "
+        "selector prompt and anchored plan, then exit without calling the model",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser.parse_args(argv)

@@ -1,12 +1,13 @@
-"""Shared multi-pass DICA pipeline engine.
+"""Shared search-first DICA pipeline engine.
 
 Single source of truth for the lifecycle used by the CLI (``main.py``) and
 the Gradio UI (``app.py``):
 
-    ingest -> dispatch
-        -> Pass 0 draft (ZERO references; abort if ``ast.parse`` fails)
-        -> Passes 1..N single-reference alignment (rollback on regression)
-        -> cloud polish (fail-soft stub)
+    ingest vault
+        -> agentic catalog selection (local model, temperature 0)
+        -> resolve pattern name (dispatcher top-1 fallback on hallucination)
+        -> anchored generation (single gold reference)
+        -> cloud polish (optional; fail-soft stub when unset)
         -> verify (ruff + mypy)
         -> self-correction loop
 
@@ -30,24 +31,33 @@ from pydantic import BaseModel, ConfigDict
 
 from dica.config import OllamaConfig, get_config
 from dica.context import ContextBudget
-from dica.dispatcher import DispatchResult, IntentDispatcher
+from dica.dispatcher import IntentDispatcher
 from dica.embeddings import OllamaEmbedder, SemanticIndex
-from dica.orchestrator import PromptOrchestrator, PromptPayload
+from dica.orchestrator import (
+    PromptOrchestrator,
+    PromptPayload,
+    build_selector_payload,
+    parse_selection_name,
+)
 from dica.sandbox import ExtractionResult, extract_python_code, verify
-from dica.vault import CodeVault
+from dica.vault import CodeChunk, CodeVault, get_vault_catalog
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CORPUS: Final[Path] = Path(__file__).resolve().parent.parent / "reference_corpus"
-REFINEMENT_PASSES: Final[int] = 3
-FORMAT_RETRIES: Final[int] = 2
 
 
 class SupportsComplete(Protocol):
     """Structural type for any async LLM client the engine can drive."""
 
-    async def complete(self, prompt: str) -> str:
-        """Return the model's raw text response for ``prompt``."""
+    async def complete(
+        self, prompt: str, *, temperature: float | None = None
+    ) -> str:
+        """Return the model's raw text response for ``prompt``.
+
+        Optional ``temperature`` overrides the client's default sampling
+        temperature for this call (used for deterministic selection).
+        """
         ...
 
 
@@ -91,14 +101,21 @@ class LocalLLMClient:
         self._config = config
         self._url = f"{config.host.rstrip('/')}/api/chat"
 
-    async def complete(self, prompt: str) -> str:
-        """One non-streaming chat round-trip. Raises on transport failure."""
+    async def complete(
+        self, prompt: str, *, temperature: float | None = None
+    ) -> str:
+        """One non-streaming chat round-trip. Raises on transport failure.
+
+        When ``temperature`` is set it overrides :attr:`LLMConfig.temperature`
+        for this request only (agentic selection uses ``0.0``).
+        """
+        temp = self._config.temperature if temperature is None else temperature
         request = {
             "model": self._config.model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "options": {
-                "temperature": self._config.temperature,
+                "temperature": temp,
                 "num_ctx": self._config.num_ctx,
             },
         }
@@ -179,7 +196,7 @@ class _GenResult:
 
 
 class PipelineEngine:
-    """Owns vault/dispatcher/orchestrator and runs the full multi-pass lifecycle.
+    """Owns vault/dispatcher/orchestrator and runs the search-first lifecycle.
 
     Construct once (UI) or per invocation (CLI). Inject any
     :class:`SupportsComplete` client for tests or alternate backends.
@@ -202,6 +219,7 @@ class PipelineEngine:
         # Optional semantic side-table (fail-soft). Built only when weight > 0;
         # if Ollama/embed model is unavailable the index reports available=False
         # and the dispatcher falls back to lexical + structural scoring.
+        # Used only when agentic selection fails to resolve a valid pattern name.
         semantic_index: SemanticIndex | None = None
         semantic_ready = False
         if cfg.dispatch.semantic_weight > 0.0 and self._chunk_count > 0:
@@ -230,6 +248,7 @@ class PipelineEngine:
             semantic_index=semantic_index,
         )
         self._orchestrator = PromptOrchestrator()
+        self._format_retries = cfg.engine.format_retries
         self._max_attempts = (
             cfg.engine.max_retries if max_attempts is None else max_attempts
         )
@@ -243,11 +262,11 @@ class PipelineEngine:
         )
         logger.info(
             "PipelineEngine ready: %d chunks from %s "
-            "(top_k=%d, max_retries=%d, prompt_budget=%d tokens, "
-            "semantic=%s)",
+            "(format_retries=%d, max_retries=%d, prompt_budget=%d tokens, "
+            "semantic_fallback=%s)",
             self._chunk_count,
             corpus,
-            cfg.dispatch.top_k,
+            self._format_retries,
             self._max_attempts,
             self._budget.budget_tokens,
             "on" if semantic_ready else "off",
@@ -278,10 +297,11 @@ class PipelineEngine:
             return
 
         payload = result.payload
-        for attempt in range(1, FORMAT_RETRIES + 2):
+        max_format_attempts = self._format_retries + 1
+        for attempt in range(1, max_format_attempts + 1):
             yield PipelineEvent(
                 message=(
-                    f"{label}: attempt {attempt}/{FORMAT_RETRIES + 1} — "
+                    f"{label}: attempt {attempt}/{max_format_attempts} — "
                     "calling local model ..."
                 ),
                 code=code_so_far,
@@ -354,6 +374,118 @@ class PipelineEngine:
         result.payload = payload
         result.code = None
 
+    async def _resolve_reference(
+        self,
+        task: str,
+        *,
+        target_code: str | None,
+        dry_run: bool,
+    ) -> AsyncIterator[PipelineEvent | CodeChunk]:
+        """Agentic catalog selection with hybrid-dispatch fallback.
+
+        Yields progress :class:`PipelineEvent`s, then yields the resolved
+        :class:`CodeChunk` as the final item (or a fatal finished event and
+        no chunk when resolution is impossible).
+        """
+        yield PipelineEvent(
+            message="agent: building reference catalog for model selection..."
+        )
+        catalog_text = get_vault_catalog(self._vault)
+        selector_prompt = build_selector_payload(
+            target_code or "", task, catalog_text
+        )
+        known_names = [c.name for c in self._vault]
+
+        selected_name: str | None = None
+        raw_selection: str | None = None
+
+        if not dry_run:
+            if self._client is None:
+                yield PipelineEvent(
+                    message="No LLM client configured (cannot select pattern).",
+                    level="error",
+                    fatal=True,
+                    finished=True,
+                    exit_code=1,
+                )
+                return
+            yield PipelineEvent(
+                message="agent: querying local model for architectural blueprint..."
+            )
+            try:
+                raw_selection = await self._client.complete(
+                    selector_prompt, temperature=0.0
+                )
+                selected_name = parse_selection_name(raw_selection, known_names)
+            except Exception as exc:
+                logger.warning("Agentic search failed: %s", exc)
+                yield PipelineEvent(
+                    message=(
+                        f"agent: selection query failed ({exc}) — "
+                        "falling back to semantic dispatcher"
+                    ),
+                    level="warning",
+                )
+
+        target_chunk: CodeChunk | None = None
+        if selected_name:
+            target_chunk = self._vault.get_by_name(selected_name)
+
+        if target_chunk is not None:
+            yield PipelineEvent(
+                message=(
+                    f"agent: successfully locked onto blueprint "
+                    f"'{target_chunk.name}'"
+                )
+            )
+        else:
+            if raw_selection is not None and selected_name is None:
+                preview = raw_selection.strip().replace("\n", " ")[:80]
+                yield PipelineEvent(
+                    message=(
+                        f"agent: selection {preview!r} invalid. "
+                        "Falling back to semantic dispatcher."
+                    ),
+                    level="warning",
+                )
+            elif selected_name is not None:
+                yield PipelineEvent(
+                    message=(
+                        f"agent: selection '{selected_name}' not in vault. "
+                        "Falling back to semantic dispatcher."
+                    ),
+                    level="warning",
+                )
+            elif dry_run:
+                yield PipelineEvent(
+                    message=(
+                        "agent: dry-run skips model selection — "
+                        "resolving blueprint via dispatcher fallback"
+                    )
+                )
+
+            hits = await self._dispatcher.dispatch(task, top_k=1)
+            target_chunk = hits[0].chunk if hits else None
+            if target_chunk is not None:
+                yield PipelineEvent(
+                    message=(
+                        f"dispatcher: fallback blueprint "
+                        f"'{target_chunk.name}' (score {hits[0].total:.2f})"
+                    )
+                )
+
+        if target_chunk is None:
+            yield PipelineEvent(
+                message="Critical failure: No reference could be resolved.",
+                level="error",
+                fatal=True,
+                finished=True,
+                exit_code=1,
+            )
+            return
+
+        yield target_chunk
+
     async def run(
         self,
         task: str,
@@ -361,13 +493,14 @@ class PipelineEngine:
         target_code: str | None = None,
         dry_run: bool = False,
     ) -> AsyncIterator[PipelineEvent]:
-        """Execute the full lifecycle, yielding progress events.
+        """Execute the search-first lifecycle, yielding progress events.
 
         Args:
             task: User instruction (generation or refactor orders).
             target_code: Optional messy script contents for refactor mode.
-            dry_run: If True, render Pass 0 payload + schedule and finish
-                without calling the model.
+            dry_run: If True, resolve a blueprint via dispatcher fallback,
+                render the anchored generation payload, and finish without
+                calling the model.
         """
         if self._chunk_count == 0:
             yield PipelineEvent(
@@ -383,64 +516,70 @@ class PipelineEngine:
             message=f"vault: {self._chunk_count} gold chunks indexed"
         )
 
-        hits: list[DispatchResult] = await self._dispatcher.dispatch(task)
-        matched = (
-            ", ".join(f"{h.chunk.name} ({h.total:.2f})" for h in hits)
-            or "(none)"
-        )
-        yield PipelineEvent(message=f"dispatcher: matched {matched}")
+        # ---- 1–2. Agentic search + resolution / fallback ----------------- #
+        target_chunk: CodeChunk | None = None
+        async for item in self._resolve_reference(
+            task, target_code=target_code, dry_run=dry_run
+        ):
+            if isinstance(item, CodeChunk):
+                target_chunk = item
+            else:
+                yield item
+                if item.fatal and item.finished:
+                    return
 
-        schedule = hits[:REFINEMENT_PASSES]
-        if len(schedule) < REFINEMENT_PASSES:
+        if target_chunk is None:
+            # Fatal events already yielded by _resolve_reference.
+            return
+
+        # ---- Dry-run: show selector + anchored plan without generation --- #
+        if dry_run:
+            catalog_text = get_vault_catalog(self._vault)
+            selector_prompt = build_selector_payload(
+                target_code or "", task, catalog_text
+            )
+            payload = self._orchestrator.build_anchored_payload(
+                task, target_code or "", target_chunk
+            )
+            assembled = payload.render_budgeted(self._budget)
             yield PipelineEvent(
                 message=(
-                    f"dispatcher: only {len(schedule)} hit(s) available — "
-                    f"running {len(schedule)} refinement pass(es) "
-                    f"instead of {REFINEMENT_PASSES}"
+                    f"dry-run: scheduled to generate against {target_chunk.name}"
                 ),
-                level="warning",
-            )
-
-        draft_payload = self._orchestrator.build_draft_payload(
-            task, target_code=target_code
-        )
-        draft_assembled = draft_payload.render_budgeted(self._budget)
-        yield PipelineEvent(
-            message=(
-                f"orchestrator: pass 0 draft payload rendered "
-                f"({len(draft_assembled.text)} chars, "
-                f"~{draft_assembled.report.used_tokens} tokens, "
-                f"0 references planned)"
-            )
-        )
-
-        if dry_run:
-            schedule_lines = tuple(
-                f"  Pass {i}: {hit.chunk.name} (score {hit.total:.2f})"
-                for i, hit in enumerate(schedule, start=1)
-            )
-            yield PipelineEvent(
-                message="dry-run: Pass 0 payload and schedule ready",
-                dry_run_text=draft_assembled.text,
-                schedule_lines=schedule_lines,
+                dry_run_text=selector_prompt,
+                schedule_lines=(
+                    f"  Blueprint: {target_chunk.name} "
+                    f"({target_chunk.file_path})",
+                    f"  Anchored generation payload: "
+                    f"~{assembled.report.used_tokens} tokens "
+                    f"({len(assembled.text)} chars)",
+                ),
                 finished=True,
                 exit_code=0,
             )
             return
 
-        # ---- Pass 0 ------------------------------------------------------ #
+        # ---- 3. Anchored generation -------------------------------------- #
         yield PipelineEvent(
-            message=f"pass 0/{len(schedule)}: drafting (no references) ..."
+            message=(
+                f"generation: drafting code using {target_chunk.name} "
+                "as primary constraint..."
+            )
         )
-        gen = _GenResult(payload=draft_payload)
-        async for event in self._generate(gen, label="pass 0", code_so_far=None):
+        payload = self._orchestrator.build_anchored_payload(
+            task, target_code or "", target_chunk
+        )
+        gen = _GenResult(payload=payload)
+        async for event in self._generate(
+            gen, label="anchored generation", code_so_far=None
+        ):
             yield event
             if gen.fatal:
                 return
 
         if gen.code is None:
             yield PipelineEvent(
-                message="pass 0 never produced a code block — aborting.",
+                message="Generation failed to produce valid code.",
                 level="error",
                 fatal=True,
                 finished=True,
@@ -452,7 +591,7 @@ class PipelineEngine:
         if syntax_error is not None:
             yield PipelineEvent(
                 message=(
-                    f"pass 0: draft failed ast.parse "
+                    f"generation: output failed ast.parse "
                     f"(line {syntax_error.lineno}: {syntax_error.msg}) — aborting."
                 ),
                 level="error",
@@ -465,75 +604,28 @@ class PipelineEngine:
         current_code = gen.code
         final_payload = gen.payload
         yield PipelineEvent(
-            message=f"pass 0: draft captured ({count_lines(current_code)} lines)",
+            message=(
+                f"generation: draft captured ({count_lines(current_code)} lines)"
+            ),
             code=current_code,
         )
 
-        # ---- Passes 1..N ------------------------------------------------- #
-        for pass_no, hit in enumerate(schedule, start=1):
-            payload = self._orchestrator.build_refinement_payload(
-                previous_code=current_code,
-                result=hit,
-                original_task=task,
-                pass_index=pass_no,
-                total_passes=len(schedule),
-            )
-            yield PipelineEvent(
-                message=(
-                    f"pass {pass_no}/{len(schedule)}: aligning to "
-                    f"'{hit.chunk.name}' (score {hit.total:.2f})"
-                ),
-                code=current_code,
-            )
-            gen = _GenResult(payload=payload)
-            async for event in self._generate(
-                gen, label=f"pass {pass_no}", code_so_far=current_code
-            ):
-                yield event
-                if gen.fatal:
-                    return
-
-            if gen.code is None:
-                yield PipelineEvent(
-                    message=(
-                        f"pass {pass_no}: no usable code after retries — "
-                        f"carrying pass {pass_no - 1} output forward"
-                    ),
-                    code=current_code,
-                    level="warning",
-                )
-                continue
-
-            syntax_error = syntax_regression(gen.code)
-            if syntax_error is not None:
-                yield PipelineEvent(
-                    message=(
-                        f"pass {pass_no}: syntax regression "
-                        f"(line {syntax_error.lineno}: {syntax_error.msg}) — "
-                        f"rolling back to pass {pass_no - 1} output"
-                    ),
-                    code=current_code,
-                    level="warning",
-                )
-                continue
-
-            current_code = gen.code
-            final_payload = gen.payload
-            yield PipelineEvent(
-                message=(
-                    f"pass {pass_no}: aligned output captured "
-                    f"({count_lines(current_code)} lines)"
-                ),
-                code=current_code,
-            )
-
-        # ---- Cloud polish (fail-soft) ------------------------------------ #
+        # ---- 4. Cloud polish (optional; skipped when unset) -------------- #
         yield PipelineEvent(
-            message="cloud: offering draft for cloud polish ...",
+            message="cloud: offering draft for cloud polish (optional) ...",
             code=current_code,
         )
         try:
             polished = await cloud_polish(current_code, task)
+        except CloudPolishError as exc:
+            logger.info("Cloud polish skipped (not configured): %s", exc)
+            yield PipelineEvent(
+                message=(
+                    "cloud: polish not configured — skipping "
+                    "(optional step; using local draft)"
+                ),
+                code=current_code,
+            )
         except Exception as exc:
             logger.warning("Cloud polish unavailable: %s", exc)
             yield PipelineEvent(
@@ -566,7 +658,7 @@ class PipelineEngine:
                     level="warning",
                 )
 
-        # ---- Verify + self-correction ------------------------------------ #
+        # ---- 5. Verify + self-correction --------------------------------- #
         yield PipelineEvent(
             message=(
                 f"sandbox: verifying final output "

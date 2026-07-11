@@ -17,7 +17,9 @@ Hybrid relevance model
 
 Empty / stopword-only prompts (no retrieval tokens and no usable lexical or
 semantic signal) fall back to a **tag-richness** ranking so the pipeline
-still gets gold-standard anchors rather than an empty schedule (M5).
+still gets gold-standard anchors rather than an empty result (M5). The
+pipeline uses this dispatcher as a **fallback** when agentic catalog
+selection fails to resolve a valid pattern name.
 
 Scoring weights and default ``top_k`` come from :class:`~dica.config.DispatchConfig`.
 """
@@ -124,7 +126,7 @@ class IntentDispatcher:
 
         If the query has no retrieval tokens (or no hits after scoring) and
         semantic ranking is unavailable, returns a tag-richness fallback
-        schedule so refinement passes still have anchors.
+        ranking so the pipeline still has a blueprint candidate.
         """
         k = self._cfg.top_k if top_k is None else top_k
         if k < 1 or len(self._vault) == 0:

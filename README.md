@@ -1,27 +1,29 @@
 # DICA — Dynamic In-Context Alignment
 
-Local-first scaffolding around [Ollama](https://ollama.com) that mines gold-standard Python with AST analysis, retrieves it with hybrid lexical / structural / semantic scoring, injects it as rigid in-context references, and quality-gates model output with **ruff** + **mypy** in a multi-pass self-correction loop.
+Local-first scaffolding around [Ollama](https://ollama.com) that mines gold-standard Python with AST analysis, lets the model **select** the best gold pattern from a vault catalog, injects that single reference as a rigid in-context blueprint, and quality-gates model output with **ruff** + **mypy** in a self-correction loop.
 
 Use the **CLI** (`main.py`) or the **Gradio** copilot UI (`app.py`). Both share one engine: `dica.pipeline.PipelineEngine`.
 
 ## Features
 
-- **Corpus vault** — AST-ingest gold-standard modules into an in-memory index
-- **Hybrid dispatch** — Jaccard lexical scoring + structural tag boosts + optional Ollama embeddings; empty/stopword queries fall back to tag-richness ranking
+- **Corpus vault** — AST-ingest gold-standard modules into an in-memory index with a token-dense catalog menu
+- **Agentic selection** — local model picks one pattern name from the catalog (temperature 0); hybrid dispatch is the fallback if selection fails
+- **Anchored generation** — one gold reference + dynamic tag constraints + budgeted prompt packing
 - **Budgeted prompts** — `ContextBudget` keeps system / target / diagnostics / references inside `num_ctx` (middle-out diagnostic truncation)
-- **Multi-pass refinement** — Pass 0 draft (no references), then single-reference alignment with `ast.parse` gates (abort on Pass 0 failure; rollback on later regressions)
 - **Extraction gate** — only `ExtractionResult.ok` code advances; format retries use real failure diagnostics
 - **Sandbox verification** — ruff + mypy (Docker hardened backend, or local fallback; hung checkers are killed on timeout)
+- **Optional cloud polish** — fail-soft stub; skipped cleanly when not configured
 - **Gradio UI** — streams stage logs and evolving code on `http://127.0.0.1:7860`
 - **Config-driven** — `config.toml` / `$DICA_CONFIG` via `dica.config.get_config()`
 
 ## Pipeline (high level)
 
 ```
-ingest corpus → dispatch (top_k)
-  → Pass 0 draft (task ± target script)
-  → Passes 1..N: align one gold chunk at a time
-  → cloud polish (optional stub, fail-soft)
+ingest corpus → vault catalog
+  → agentic selection (local model, temp 0)
+  → resolve pattern (dispatcher top-1 fallback on invalid name)
+  → anchored generation (single gold reference)
+  → cloud polish (optional; skipped if unset)
   → verify (ruff + mypy)
   → self-correction loop (budgeted diagnostics)
 ```
@@ -44,7 +46,7 @@ ingest corpus → dispatch (top_k)
 ├── tests/                  # Unit + scripted pipeline tests
 ├── .github/workflows/      # CI (pytest on push/PR)
 └── dica/
-    ├── pipeline.py         # Shared multi-pass engine
+    ├── pipeline.py         # Shared search-first engine
     ├── config.py           # TOML load + Pydantic defaults
     ├── vault.py            # AST ingest + Jaccard search
     ├── dispatcher.py       # Hybrid retrieval
@@ -99,10 +101,10 @@ ollama pull nomic-embed-text
 | Section | Controls |
 |---------|----------|
 | `[ollama]` | host, generation model, embed model, `num_ctx`, temperature, timeouts |
-| `[dispatch]` | `top_k`, lexical / semantic weights, structural & name boosts |
+| `[dispatch]` | `top_k` (fallback ranking depth), lexical / semantic weights, structural & name boosts |
 | `[context]` | chars/token heuristic, reserved output tokens, diagnostic / min-chunk caps |
 | `[sandbox]` | `backend` (`auto` \| `docker` \| `local`), image, timeout, resource limits |
-| `[engine]` | `max_retries` (self-correction budget) |
+| `[engine]` | `format_retries`, `max_retries` |
 
 Override the config path:
 
@@ -124,10 +126,10 @@ CLI flags **`--model`** and **`--max-attempts`** default to config values and ca
 ### CLI
 
 ```bash
-# Render Pass 0 payload + refinement schedule (no model call)
+# Resolve blueprint via dispatcher + render selector / plan (no model call)
 python main.py --dry-run "Build an async CRUD router for a Product resource"
 
-# Full multi-pass lifecycle + verification
+# Full search-first lifecycle + verification
 python main.py "Build an async CRUD router for a Product resource with Pydantic validation"
 
 # Refactor a messy script against the corpus
@@ -166,11 +168,12 @@ CI runs the suite on push/PR to `main` (Python 3.11 and 3.12): `.github/workflow
 
 ## Extending
 
-- **Retrieval** — `CodeVault.search` (Jaccard) and `IntentDispatcher` (hybrid + fallback) are the ranking seams; `SemanticIndex` is a fail-soft side-table over embeddings
-- **Prompts** — `PromptPayload.render_budgeted(ContextBudget)` owns `num_ctx` packing; `PromptOrchestrator.build_correction` attaches diagnostics for middle-out truncation
+- **Catalog / selection** — `get_vault_catalog` + `build_selector_payload` / `parse_selection_name`; invalid names fall back to `IntentDispatcher.dispatch(..., top_k=1)`
+- **Retrieval** — `CodeVault.search` (Jaccard) and `IntentDispatcher` (hybrid + tag-richness) are fallback seams; `SemanticIndex` is a fail-soft side-table over embeddings
+- **Prompts** — `build_anchored_payload` for generation; `PromptPayload.render_budgeted(ContextBudget)` owns `num_ctx` packing; `build_correction` attaches diagnostics for middle-out truncation
 - **Lifecycle** — add stages in `dica/pipeline.py` once; CLI and UI both consume `PipelineEvent`s
 - **Sandbox** — checker args live in `sandbox.py` (host) and `sandbox_image/runner.py` (container); Docker path is network-disabled, resource-capped, non-root
-- **Cloud polish** — `cloud_polish` is a fail-soft stub; wire a frontier API without changing the pipeline contract
+- **Cloud polish** — optional; stub raises `CloudPolishError` and is skipped when not configured; wire a frontier API without changing the pipeline contract
 
 ## License
 

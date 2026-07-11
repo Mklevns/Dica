@@ -13,17 +13,20 @@ request_timeout_seconds = 300.0
 embed_timeout_seconds = 10.0
 
 [dispatch]
-top_k = 3                          # retrieve one hit per refinement pass (see REFINEMENT_PASSES)
+top_k = 3                          # hybrid ranking depth; fallback uses top_k=1 after failed selection
 lexical_weight = 1.0
 semantic_weight = 0.75             # set 0.0 to disable semantic scoring (needs Ollama embed model)
 structural_boost = 0.35            # per matched structural intent tag
 name_boost = 0.15                  # query token verbatim in chunk name
 
 [context]
-chars_per_token = 3.2              # conservative for dense Python source
+tokenizer = "tiktoken"             # "tiktoken" (BPE) | "heuristic" (chars_per_token)
+tiktoken_encoding = "cl100k_base"  # packing proxy; accurate on dense/base64 text
+chars_per_token = 3.2              # fallback only if tiktoken unavailable
+token_safety_margin = 0.05         # leave 5% of num_ctx spare for model tokenizer skew
 reserve_output_tokens = 1536       # head-room for the model's reply
 max_diagnostic_tokens = 1200       # linter output cap before middle-out truncation
-min_chunk_tokens = 64              # below this, don't bother truncating a chunk — drop it
+min_chunk_tokens = 64              # below this, don't bother admitting a chunk — drop it
 
 [sandbox]
 backend = "auto"                   # "docker" | "local" | "auto" (probe docker, else local)
@@ -34,4 +37,5 @@ pids_limit = 64
 cpu_quota_percent = 100            # 100 == one full core
 
 [engine]
-max_retries = 3
+format_retries = 2                 # extra attempts when extraction/ast gate fails
+max_retries = 3                    # sandbox self-correction budget after verify

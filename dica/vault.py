@@ -172,6 +172,23 @@ class CodeVault:
     def __iter__(self) -> Iterator[CodeChunk]:
         return iter(self._chunks.values())
 
+    def get_by_name(self, name: str) -> CodeChunk | None:
+        """Return the first chunk whose ``name`` matches ``name`` (case-insensitive).
+
+        When multiple chunks share a name, the deterministic catalog order
+        (name, path, lineno) wins so agentic selection is stable.
+        """
+        needle = name.strip().lower()
+        if not needle:
+            return None
+        for chunk in sorted(
+            self._chunks.values(),
+            key=lambda c: (c.name.lower(), c.file_path, c.lineno),
+        ):
+            if chunk.name.lower() == needle:
+                return chunk
+        return None
+
     # ------------------------------------------------------------------ #
     # Ingestion
     # ------------------------------------------------------------------ #
@@ -321,3 +338,30 @@ class CodeVault:
             score = len(overlap) / len(union)
             results.append((chunk, score))
         return results
+
+
+def get_vault_catalog(vault: CodeVault) -> str:
+    """Render a token-dense menu of available :class:`CodeChunk` references.
+
+    Used by the agentic selection phase so the model can pick a structural
+    blueprint without loading full gold-standard sources into the prompt.
+    Chunks are ordered deterministically for stable prompts and tests.
+    """
+    lines: list[str] = []
+    chunks = sorted(
+        vault,
+        key=lambda c: (c.name.lower(), c.file_path, c.lineno),
+    )
+    for chunk in chunks:
+        tags = chunk.tags.model_dump()
+        tags_list = [attr for attr, val in tags.items() if val is True]
+        tags_str = ", ".join(tags_list) if tags_list else "none"
+
+        lines.append(f"- Pattern Name: {chunk.name}")
+        lines.append(f"  Origin: {chunk.file_path}")
+        lines.append(f"  Structural Attributes: [{tags_str}]")
+        if chunk.docstring:
+            intent = " ".join(chunk.docstring.strip().split())
+            lines.append(f"  Intent: {intent}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + ("\n" if lines else "")

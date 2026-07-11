@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dica.vault import ChunkKind, CodeVault, tokenize
+from dica.vault import ChunkKind, CodeVault, get_vault_catalog, tokenize
 
 
 def test_tokenize_snake_and_camel() -> None:
@@ -79,6 +79,26 @@ def test_jaccard_penalizes_broad_keyword_bags(tmp_path: Path) -> None:
 def test_search_empty_query_returns_no_lexical_hits(corpus_vault: CodeVault) -> None:
     assert corpus_vault.search([]) == []
     assert corpus_vault.search(set()) == []
+
+
+def test_get_vault_catalog_lists_patterns(corpus_vault: CodeVault) -> None:
+    catalog = get_vault_catalog(corpus_vault)
+    assert "Pattern Name:" in catalog
+    assert "Structural Attributes:" in catalog
+    # At least one known corpus symbol appears
+    assert "create_item" in catalog or "AsyncUserRepository" in catalog
+
+
+def test_get_vault_catalog_empty() -> None:
+    assert get_vault_catalog(CodeVault()) == ""
+
+
+def test_get_by_name_case_insensitive(corpus_vault: CodeVault) -> None:
+    sample = next(iter(corpus_vault))
+    found = corpus_vault.get_by_name(sample.name.upper())
+    assert found is not None
+    assert found.name == sample.name
+    assert corpus_vault.get_by_name("___missing___") is None
 
 
 def test_skips_syntax_error_file(tmp_path: Path) -> None:

@@ -51,7 +51,7 @@ class DispatchConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    # Default covers the standard multi-pass schedule (one hit per refinement).
+    # Used when agentic selection fails; fallback path takes top_k=1.
     top_k: int = Field(default=3, ge=1)
     lexical_weight: float = Field(default=1.0, ge=0.0)
     semantic_weight: float = Field(default=0.75, ge=0.0)
@@ -60,11 +60,26 @@ class DispatchConfig(BaseModel):
 
 
 class ContextConfig(BaseModel):
-    """Token-budget heuristics for payload assembly."""
+    """Token-budget controls for payload assembly.
+
+    Prefer ``tokenizer="tiktoken"`` (default): BPE counts catch dense base64 /
+    non-ASCII / long-identifier text that a static chars-per-token heuristic
+    under-counts — under-counting lets prompts exceed ``num_ctx`` and local
+    models left-truncate system instructions + target script silently.
+    """
 
     model_config = ConfigDict(frozen=True)
 
+    tokenizer: Literal["tiktoken", "heuristic"] = "tiktoken"
+    tiktoken_encoding: str = Field(
+        default="cl100k_base",
+        description="tiktoken encoding used for packing (proxy for local models).",
+    )
+    # Fallback density when tokenizer=heuristic or tiktoken fails to load.
     chars_per_token: float = Field(default=3.2, gt=1.0)
+    # Shrink the usable window slightly so model-specific tokenizers that run
+    # denser than cl100k_base still leave headroom for the reserved reply.
+    token_safety_margin: float = Field(default=0.05, ge=0.0, le=0.25)
     reserve_output_tokens: int = Field(default=1536, ge=0)
     max_diagnostic_tokens: int = Field(default=1200, ge=64)
     min_chunk_tokens: int = Field(default=64, ge=1)
@@ -84,11 +99,20 @@ class SandboxConfig(BaseModel):
 
 
 class EngineConfig(BaseModel):
-    """Self-correction loop parameters."""
+    """Anchored generation retries and self-correction loop parameters."""
 
     model_config = ConfigDict(frozen=True)
 
-    max_retries: int = Field(default=3, ge=0)
+    format_retries: int = Field(
+        default=2,
+        ge=0,
+        description="Extra model retries after a failed code-extraction gate.",
+    )
+    max_retries: int = Field(
+        default=3,
+        ge=0,
+        description="Sandbox self-correction attempts after verify failures.",
+    )
 
 
 class DicaConfig(BaseModel):

@@ -1,6 +1,6 @@
 """DICA Refactoring Copilot — thin Gradio adapter over PipelineEngine.
 
-All multi-pass lifecycle logic lives in :mod:`dica.pipeline`. This module
+All search-first lifecycle logic lives in :mod:`dica.pipeline`. This module
 only validates uploads, streams :class:`~dica.pipeline.PipelineEvent`
 snapshots into Gradio panels, and launches the local UI.
 
@@ -108,10 +108,10 @@ def build_app(engine: RefactorEngine) -> gr.Blocks:
         gr.Markdown(
             "# DICA Refactoring Copilot\n"
             "Upload a messy script, state your orders, and watch the "
-            "multi-pass pipeline draft, align, polish, and verify it against "
-            "the gold-standard corpus (ruff + mypy gated). "
-            "Local-first via Ollama (model from config.toml), with an "
-            "optional cloud polish pass (fail-soft stub)."
+            "search-first pipeline select a gold blueprint, generate, "
+            "optionally polish, and verify against the corpus "
+            "(ruff + mypy gated). Local-first via Ollama (model from "
+            "config.toml); cloud polish is optional and skipped when unset."
         )
         with gr.Row():
             with gr.Column(scale=1):

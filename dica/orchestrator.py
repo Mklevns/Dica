@@ -1,37 +1,41 @@
 """Module 3: Prompt Orchestrator (context-window optimized).
 
-Assembles the final, rigidly-delimited context payload sent to the local LLM,
-with three compression / alignment optimizations over the v1 orchestrator:
+Assembles the rigidly-delimited context payload sent to the local LLM for
+**agentic selection** and **anchored generation**, with three compression /
+alignment optimizations:
 
-1. **AST Pruning** — reference snippets are round-tripped through the ``ast``
-   module with docstrings stripped (:func:`distill_syntax`). Docstrings are
-   the least token-dense part of a gold snippet: the model needs the
-   *structure* (signatures, decorators, typing discipline), not the prose.
+1. **CST docstring distillation** — reference snippets are rewritten with
+   :mod:`libcst` so module/class/function docstrings are removed
+   (:func:`distill_syntax`) while **inline and full-line comments stay**.
+   Docstrings are the least token-dense part of a gold snippet; comments often
+   carry the architectural "why" the model is told to reproduce as patterns.
 2. **Dynamic Rule Extraction** — the boolean :class:`~dica.vault.ChunkTags`
-   on the dispatched chunks are aggregated into explicit natural-language
-   constraints ("You must use async/await ..."), so the structural intent the
-   dispatcher detected is *stated*, not merely implied by example.
+   on the selected (or fallback-dispatched) chunk are aggregated into explicit
+   natural-language constraints ("You must use async/await ..."), so structural
+   intent is *stated*, not merely implied by example.
 3. **Recency Anchoring** — the payload is reordered so the target script sits
    at the *top* (stable context), while constraints, references, and finally
    the active task sit progressively closer to the generation point. Small
    local models weight recent tokens most heavily; the task therefore renders
    last, immediately before the model begins emitting.
 
-The payload remains a frozen Pydantic model: every prompt that ever hits the
-model is a validated, serializable, loggable artifact.
+The generation payload remains a frozen Pydantic model: every prompt that
+hits the model for code emission is a validated, serializable, loggable
+artifact. Selector prompts are plain strings (short-answer name only).
 """
 
 from __future__ import annotations
 
-import ast
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
+import libcst as cst
+import libcst.matchers as m
 from pydantic import BaseModel, ConfigDict, Field
 
 from dica.context import AssembledPayload, BudgetSection, ContextBudget
 from dica.dispatcher import DispatchResult
-from dica.vault import ChunkTags
+from dica.vault import ChunkTags, CodeChunk
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +65,9 @@ Rules of engagement:
    constraint must hold in your output.
 3. The reference code defines the REQUIRED style: naming, typing discipline,
    error handling, and async patterns. Docstrings have been stripped from the
-   references for brevity — your OUTPUT must still include Google-style
-   docstrings on every public function and class.
+   references for brevity, but inline comments are preserved as architectural
+   guidance — your OUTPUT must still include Google-style docstrings on every
+   public function and class.
 4. Solve ONLY the task between the task delimiters. It is the final section
    of this prompt.
 5. Emit exactly ONE Python code block (```python ... ```). No prose before
@@ -70,6 +75,84 @@ Rules of engagement:
 6. All code must use Python 3.11+ syntax, full type annotations, and
    Pydantic v2 idioms where data models are needed.
 7. Never import from the reference code; reproduce patterns, not symbols."""
+
+SELECTOR_SYSTEM_INSTRUCTIONS = """\
+You are a principal software architect. Your task is to analyze a messy target \
+script, review a set of instructions, and select the ONE gold-standard reference \
+pattern from the catalog that provides the best architectural blueprint for the \
+refactor.
+
+Respond with exactly ONE line containing only the Pattern Name you selected. Do not \
+emit prose, reasoning, or markdown block formatting."""
+
+CATALOG_OPEN = "[AVAILABLE GOLD-STANDARD REFERENCE CATALOG]"
+CATALOG_CLOSE = "[END CATALOG]"
+INSTRUCTIONS_OPEN = "[REFACTORING INSTRUCTIONS]"
+INSTRUCTIONS_CLOSE = "[END REFACTORING INSTRUCTIONS]"
+
+
+def build_selector_payload(
+    target_code: str, instructions: str, catalog: str
+) -> str:
+    """Build the short-answer prompt used for agentic pattern selection.
+
+    The model must reply with a single pattern name from ``catalog``. Full
+    gold sources are not included — only the token-dense catalog menu.
+    """
+    target_body = target_code.strip() if target_code else "(no target script provided)"
+    return (
+        f"{SELECTOR_SYSTEM_INSTRUCTIONS}\n\n"
+        f"{TARGET_OPEN}\n"
+        f"{target_body}\n"
+        f"{TARGET_CLOSE}\n\n"
+        f"{INSTRUCTIONS_OPEN}\n"
+        f"{instructions.strip()}\n"
+        f"{INSTRUCTIONS_CLOSE}\n\n"
+        f"{CATALOG_OPEN}\n"
+        f"{catalog.strip()}\n"
+        f"{CATALOG_CLOSE}\n\n"
+        "Analyze the target script and instructions. Which pattern name is the "
+        "single best match?\n"
+        "Selection:"
+    )
+
+
+def parse_selection_name(raw: str, known_names: Sequence[str]) -> str | None:
+    """Extract a vault pattern name from a noisy model selection response.
+
+    Tries, in order: exact case-insensitive match on the first non-empty line;
+    then the first known name that appears as a whole token in the response.
+    """
+    text = raw.strip().strip("`\"'")
+    if not text:
+        return None
+
+    known_by_lower = {n.lower(): n for n in known_names}
+    first_line = next(
+        (ln.strip().strip("`\"'") for ln in text.splitlines() if ln.strip()),
+        "",
+    )
+    if first_line:
+        # Drop common prefixes models sometimes emit.
+        for prefix in ("selection:", "pattern name:", "pattern:", "name:"):
+            lower = first_line.lower()
+            if lower.startswith(prefix):
+                first_line = first_line[len(prefix) :].strip().strip("`\"'")
+                break
+        if first_line.lower() in known_by_lower:
+            return known_by_lower[first_line.lower()]
+
+    # Substring fallback: longest known name wins to avoid partial collisions.
+    lowered = text.lower()
+    matches = [
+        canonical
+        for key, canonical in known_by_lower.items()
+        if key in lowered
+    ]
+    if not matches:
+        return None
+    matches.sort(key=len, reverse=True)
+    return matches[0]
 
 # Tag predicate -> emitted constraint. Ordered, typed predicates (rather than
 # getattr on a string) keep this table mypy-strict clean and refactor-safe.
@@ -106,16 +189,110 @@ _FALLBACK_CONSTRAINT = (
 )
 
 
+# Leading string expression that Python treats as a docstring (PEP 257).
+_DOCSTRING_EXPR = m.Expr(
+    value=m.OneOf(m.SimpleString(), m.ConcatenatedString())
+)
+
+
+def _is_docstring_statement(stmt: cst.BaseStatement) -> bool:
+    """True when ``stmt`` is a standalone string-literal expression statement."""
+    return m.matches(
+        stmt,
+        m.SimpleStatementLine(body=[_DOCSTRING_EXPR]),
+    )
+
+
+def _is_docstring_small_stmt(stmt: cst.BaseSmallStatement) -> bool:
+    return m.matches(stmt, _DOCSTRING_EXPR)
+
+
+def _has_executable_body(statements: Sequence[cst.BaseStatement]) -> bool:
+    """True if any non-decorative statement remains (EmptyLine does not count)."""
+    return any(not isinstance(stmt, cst.EmptyLine) for stmt in statements)
+
+
+class _DocstringStripper(cst.CSTTransformer):
+    """Remove module/class/function docstrings without rewriting other syntax.
+
+    Unlike :func:`ast.unparse`, a CST transform keeps comments, ``# type:
+    ignore`` annotations, and original formatting that carries gold-standard
+    architectural intent.
+    """
+
+    def leave_Module(
+        self, original_node: cst.Module, updated_node: cst.Module
+    ) -> cst.Module:
+        return updated_node.with_changes(
+            body=self._strip_statements(
+                updated_node.body, ensure_nonempty=False
+            )
+        )
+
+    def leave_FunctionDef(
+        self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
+    ) -> cst.FunctionDef:
+        return updated_node.with_changes(body=self._strip_suite(updated_node.body))
+
+    def leave_AsyncFunctionDef(
+        self,
+        original_node: cst.AsyncFunctionDef,
+        updated_node: cst.AsyncFunctionDef,
+    ) -> cst.AsyncFunctionDef:
+        return updated_node.with_changes(body=self._strip_suite(updated_node.body))
+
+    def leave_ClassDef(
+        self, original_node: cst.ClassDef, updated_node: cst.ClassDef
+    ) -> cst.ClassDef:
+        return updated_node.with_changes(body=self._strip_suite(updated_node.body))
+
+    def _strip_suite(self, suite: cst.BaseSuite) -> cst.BaseSuite:
+        if isinstance(suite, cst.SimpleStatementSuite):
+            return self._strip_simple_suite(suite)
+        if isinstance(suite, cst.IndentedBlock):
+            new_body = self._strip_statements(
+                suite.body, ensure_nonempty=True
+            )
+            return suite.with_changes(body=new_body)
+        return suite
+
+    def _strip_simple_suite(
+        self, suite: cst.SimpleStatementSuite
+    ) -> cst.SimpleStatementSuite:
+        """Handle one-liner bodies like ``def f(): \"\"\"doc\"\"\"``."""
+        body = list(suite.body)
+        if body and _is_docstring_small_stmt(body[0]):
+            body = body[1:]
+        if not body:
+            body = [cst.Pass()]
+        return suite.with_changes(body=tuple(body))
+
+    def _strip_statements(
+        self,
+        statements: Sequence[cst.BaseStatement],
+        *,
+        ensure_nonempty: bool,
+    ) -> Sequence[cst.BaseStatement]:
+        body = list(statements)
+        if body and _is_docstring_statement(body[0]):
+            body = body[1:]
+        if ensure_nonempty and not _has_executable_body(body):
+            # Docstring-only (or docstring + comment footer) suites are not
+            # valid without at least one real statement.
+            body.append(cst.SimpleStatementLine(body=[cst.Pass()]))
+        return tuple(body)
+
+
 def distill_syntax(source_code: str) -> str:
-    """Strip docstrings from ``source_code`` to maximize token density.
+    """Strip docstrings from ``source_code`` while preserving comments.
 
-    The source is parsed with the built-in :mod:`ast` module; the leading
-    docstring expression is removed from every ``Module``, ``FunctionDef``,
-    ``AsyncFunctionDef``, and ``ClassDef`` node, and the tree is re-serialized
-    with :func:`ast.unparse` (which also normalizes formatting).
+    Uses :mod:`libcst` so token-heavy docstrings are removed without the
+    destructive ``ast.parse`` / ``ast.unparse`` round-trip that drops ``#``
+    comments and ``type: ignore`` pragmas.
 
-    A node whose body is *only* a docstring gets an ``ast.Pass`` substituted
-    so the pruned tree still unparses to valid Python.
+    A suite whose body is *only* a docstring (optionally with leftover
+    comment lines in the block footer) gets a ``pass`` so the result remains
+    valid Python.
 
     Args:
         source_code: Python source to compress.
@@ -125,33 +302,12 @@ def distill_syntax(source_code: str) -> str:
         not parse (a broken reference must never take down payload assembly).
     """
     try:
-        tree = ast.parse(source_code)
-    except SyntaxError:
+        module = cst.parse_module(source_code)
+    except cst.ParserSyntaxError:
         logger.warning("distill_syntax: unparseable snippet left intact")
         return source_code
 
-    for node in ast.walk(tree):
-        if not isinstance(
-            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
-        ):
-            continue
-        body = node.body
-        if not body:
-            continue
-        first = body[0]
-        if (
-            isinstance(first, ast.Expr)
-            and isinstance(first.value, ast.Constant)
-            and isinstance(first.value.value, str)
-        ):
-            if len(body) == 1:
-                # Docstring-only body: removal would leave an empty (invalid)
-                # block, so substitute a `pass` statement instead.
-                body[0] = ast.Pass()
-            else:
-                body.pop(0)
-
-    return ast.unparse(tree)
+    return module.visit(_DocstringStripper()).code
 
 
 def derive_constraints(results: list[DispatchResult]) -> list[str]:
@@ -179,7 +335,9 @@ class ReferenceSnippet(BaseModel):
     name: str
     origin: str = Field(description="Source file the snippet was mined from.")
     relevance: float = Field(description="Dispatcher score, kept for logging.")
-    source: str = Field(description="AST-pruned (docstring-free) source.")
+    source: str = Field(
+        description="Docstring-stripped source (comments preserved via CST)."
+    )
 
 
 class PromptPayload(BaseModel):
@@ -188,7 +346,7 @@ class PromptPayload(BaseModel):
     Attributes:
         system_instructions: The fixed rules-of-engagement preamble.
         references: Ordered gold-standard snippets (best match first),
-            already AST-pruned at build time.
+            already docstring-distilled at build time.
         dynamic_constraints: Tag-derived architectural rules. Declared as a
             tuple for true immutability; ``build`` may pass a plain
             ``list[str]`` and Pydantic coerces it.
@@ -337,10 +495,10 @@ class PromptPayload(BaseModel):
 
 
 class PromptOrchestrator:
-    """Builds :class:`PromptPayload` objects from dispatcher output."""
+    """Builds generation payloads for agentic selection and anchored emission."""
 
     def __init__(self, system_instructions: str = DEFAULT_SYSTEM_INSTRUCTIONS) -> None:
-        """Bind the fixed system preamble used for every payload.
+        """Bind the fixed system preamble used for every generation payload.
 
         Args:
             system_instructions: Rules-of-engagement text; override for
@@ -357,10 +515,10 @@ class PromptOrchestrator:
     ) -> PromptPayload:
         """Convert ranked dispatch results + the user task into a payload.
 
-        Reference sources are AST-pruned here (once, at build time) so every
-        subsequent :meth:`PromptPayload.render` — including correction
-        retries — pays the compressed token cost. Chunk tags are aggregated
-        into explicit constraints via :func:`derive_constraints`.
+        Primarily used when the hybrid dispatcher supplies the reference
+        (fallback path). Prefer :meth:`build_anchored_payload` after agentic
+        selection. Reference sources are docstring-distilled here so correction
+        retries keep the compressed form while preserving comments.
 
         Args:
             task: The user's instruction (generation goal or refactoring
@@ -395,52 +553,44 @@ class PromptOrchestrator:
             target_task=task,
         )
 
-    def build_refinement_payload(
+    def build_anchored_payload(
         self,
-        previous_code: str,
-        result: DispatchResult,
-        original_task: str,
-        pass_index: int,
-        total_passes: int,
+        task: str,
+        target_code: str,
+        reference_chunk: CodeChunk,
     ) -> PromptPayload:
-        """Constructs the payload for an iterative single-reference alignment pass.
-        
-        The code from the previous pass is injected as the new target script.
-        Only a single gold-standard reference is included to keep the model focused,
-        and the original task is rewritten to explicitly state the refinement goals.
+        """Build a generation payload anchored to a single agent-selected reference.
 
-        Args:
-            previous_code: The parsed source code generated in the previous pass.
-            result: The single dispatcher hit for this pass.
-            original_task: The user's initial instructions.
-            pass_index: Current pass number (1-indexed).
-            total_passes: Total scheduled refinement passes.
-
-        Returns:
-            An immutable payload ready to be sent to the model.
+        The selected chunk is treated as 100% relevant. Dynamic constraints are
+        derived from its structural tags via a lightweight :class:`DispatchResult`
+        wrapper so tag → natural-language rules stay centralized.
         """
-        refinement_task = (
-            f"Pass {pass_index} of {total_passes}: Align the target script "
-            "with the provided gold-standard reference code while satisfying "
-            f"the original request.\n\nOriginal task: {original_task.strip()}"
-        )
-
         references = (
             ReferenceSnippet(
-                name=result.chunk.name,
-                origin=result.chunk.file_path,
-                relevance=round(result.total, 4),
-                source=distill_syntax(result.chunk.source),
+                name=reference_chunk.name,
+                origin=reference_chunk.file_path,
+                relevance=1.0,
+                source=distill_syntax(reference_chunk.source),
             ),
         )
-        constraints = derive_constraints([result])
-
+        mock_result = DispatchResult(
+            chunk=reference_chunk,
+            lexical_score=1.0,
+            structural_score=1.0,
+            semantic_score=0.0,
+        )
+        constraints = derive_constraints([mock_result])
+        logger.debug(
+            "Anchored payload: reference=%s constraints=%d",
+            reference_chunk.name,
+            len(constraints),
+        )
         return PromptPayload(
             system_instructions=self._system_instructions,
             references=references,
             dynamic_constraints=tuple(constraints),
-            target_code=previous_code,
-            target_task=refinement_task,
+            target_code=target_code or None,
+            target_task=task,
         )
 
     def build_correction(
@@ -501,20 +651,4 @@ class PromptOrchestrator:
             target_code=original.target_code,
             target_task=correction_task,
             diagnostics=diagnostics.strip() or None,
-        )
-
-    def build_draft_payload(
-        self, task: str, *, target_code: str | None = None
-    ) -> PromptPayload:
-        """Build the **Pass 0** payload: task + target, ZERO references.
-
-        The initial draft is produced with an unpolluted context window so
-        the model commits to a structure driven purely by the user's
-        instructions; gold-standard patterns are layered on in later passes.
-        """
-        return PromptPayload(
-            system_instructions=self._system_instructions,
-            references=(),
-            target_code=target_code,
-            target_task=task,
         )

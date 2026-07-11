@@ -46,7 +46,8 @@ def tight_budget() -> ContextBudget:
             reserve_output_tokens=200,
             max_diagnostic_tokens=64,
             min_chunk_tokens=10,
-            chars_per_token=3.2,
+            tokenizer="tiktoken",
+            token_safety_margin=0.0,
         ),
         num_ctx=900,
     )
