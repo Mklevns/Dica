@@ -167,16 +167,18 @@ def cleanup_orphaned_containers(config: SandboxConfig | None = None) -> int:
     but a ``SIGKILL`` / OOM-kill / power loss of the parent DICA process
     bypasses Python entirely and strands the container on the host. This
     sweep runs at application startup, before the first generation pass,
-    and reclaims anything matching our identity markers:
+    and reclaims anything matching our *identity* markers only:
 
     * label ``dica.sandbox`` (every container this module creates),
-    * name prefix ``dica_sandbox_``,
-    * ancestor image ``config.image`` — the belt-and-suspenders filter
-      that also catches orphans created by *older* DICA builds that
-      predate the label/name tagging.
+    * name prefix ``dica_sandbox_``.
+
+    Ancestor-image matching is intentionally **not** used: sweeping by
+    ``config.image`` would force-remove any container based on that image
+    (including manual debug containers), which is unsafe on shared Docker
+    hosts (M3).
 
     Results are deduplicated by container id before removal, so a
-    container matching all three filters is removed exactly once.
+    container matching both filters is removed exactly once.
 
     Fail-soft by contract: an unreachable daemon, a permission error, or a
     race with another process removing the same container are all logged
@@ -186,7 +188,9 @@ def cleanup_orphaned_containers(config: SandboxConfig | None = None) -> int:
     Returns:
         The number of containers actually removed.
     """
-    cfg = config if config is not None else get_config().sandbox
+    # ``config`` retained for API compatibility / future opt-in filters
+    # (e.g. optional ancestor sweep). Identity markers need no image name.
+    _ = config
     client = _docker_client()
     if client is None:
         logger.info(
@@ -195,10 +199,10 @@ def cleanup_orphaned_containers(config: SandboxConfig | None = None) -> int:
         return 0
 
     candidates: dict[str, Any] = {}
+    # Identity-only filters — never match on image ancestor alone.
     filter_sets = (
         {"label": _SANDBOX_LABEL},
         {"name": _SANDBOX_NAME_PREFIX},
-        {"ancestor": cfg.image},
     )
     for filters in filter_sets:
         try:
@@ -342,6 +346,28 @@ def _parse_runner_output(logs: str) -> list[CheckResult]:
 # --------------------------------------------------------------------- #
 # Local backend (original behaviour, retained as fallback)
 # --------------------------------------------------------------------- #
+async def _kill_process(proc: asyncio.subprocess.Process) -> None:
+    """Force-terminate a checker subprocess and wait for reaping.
+
+    Used when the local verification budget is exceeded so hung ruff/mypy
+    processes cannot linger as orphans after ``asyncio.TimeoutError``.
+    Fail-soft: a race where the process already exited is ignored.
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except (asyncio.TimeoutError, ProcessLookupError):
+        logger.warning(
+            "Timed out waiting for killed checker pid=%s to exit.",
+            proc.pid,
+        )
+
+
 async def _run_local_checker(
     tool: str, args: tuple[str, ...], target: Path
 ) -> CheckResult:
@@ -349,33 +375,95 @@ async def _run_local_checker(
 
     ``sys.executable -m <tool>`` guarantees we invoke the checker installed
     in the *current* interpreter's environment, not whatever is on PATH.
+
+    Prefer :func:`_local_verify` for production use — it applies a shared
+    timeout and kills both checkers together. This helper remains for
+    single-tool call sites and tests.
     """
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-m", tool, *args, str(target),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await proc.communicate()
+    except asyncio.CancelledError:
+        await _kill_process(proc)
+        raise
     output = (stdout.decode() + stderr.decode()).strip()
     passed = proc.returncode == 0
     logger.info("%s: %s", tool, "PASS" if passed else "FAIL")
     return CheckResult(tool=tool, passed=passed, output=output)
 
 
+async def _collect_checker(
+    tool: str, proc: asyncio.subprocess.Process
+) -> CheckResult:
+    """Await one already-spawned checker; kill it if this task is cancelled."""
+    try:
+        stdout, stderr = await proc.communicate()
+    except asyncio.CancelledError:
+        await _kill_process(proc)
+        raise
+    output = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
+    passed = proc.returncode == 0
+    logger.info("%s: %s", tool, "PASS" if passed else "FAIL")
+    return CheckResult(tool=tool, passed=passed, output=output)
+
+
 async def _local_verify(code: str, timeout: float) -> list[CheckResult]:
+    """Run ruff + mypy concurrently with a hard wall-clock budget.
+
+    On timeout both checker processes are killed and reaped so they cannot
+    outlive the verification call (M1).
+    """
     with tempfile.TemporaryDirectory(prefix="dica_sandbox_") as tmpdir:
         target = Path(tmpdir) / "candidate.py"
         # Normalize the trailing newline: fence extraction strips it, and a
         # missing EOF newline (ruff W292) is an artifact of extraction, not
         # a defect in the model's code.
         target.write_text(code.rstrip("\n") + "\n", encoding="utf-8")
-        checks = await asyncio.wait_for(
-            asyncio.gather(
-                _run_local_checker("ruff", _RUFF_ARGS, target),
-                _run_local_checker("mypy", _MYPY_ARGS, target),
-            ),
-            timeout=timeout,
+
+        specs: tuple[tuple[str, tuple[str, ...]], ...] = (
+            ("ruff", _RUFF_ARGS),
+            ("mypy", _MYPY_ARGS),
         )
+        procs: list[tuple[str, asyncio.subprocess.Process]] = []
+        for tool, args in specs:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", tool, *args, str(target),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            procs.append((tool, proc))
+
+        try:
+            checks = await asyncio.wait_for(
+                asyncio.gather(
+                    *(_collect_checker(tool, proc) for tool, proc in procs)
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Local verification exceeded %.1fs — killing %d checker(s).",
+                timeout,
+                len(procs),
+            )
+            await asyncio.gather(
+                *(_kill_process(proc) for _, proc in procs),
+                return_exceptions=True,
+            )
+            return [
+                CheckResult(
+                    tool="sandbox",
+                    passed=False,
+                    output=(
+                        f"Local verification exceeded {timeout:.0f}s; "
+                        "ruff/mypy processes were killed."
+                    ),
+                )
+            ]
     return list(checks)
 
 

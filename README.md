@@ -126,6 +126,9 @@ dispatch, context budgeting, orchestrator corrections, sandbox JSON parsing,
 and a scripted end-to-end pass through `PipelineEngine` (no live Ollama required
 for most tests).
 
+CI runs the same suite on push/PR to `main` (Python 3.11 and 3.12) via
+`.github/workflows/ci.yml`.
+
 ## Extending
 
 - **Vector store** — `CodeVault.search` is the retrieval seam; swap keyword overlap for embedding similarity (LanceDB, Chroma, etc.).
